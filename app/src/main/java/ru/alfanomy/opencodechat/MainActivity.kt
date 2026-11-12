@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
+import android.Manifest
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
@@ -29,6 +30,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -73,6 +75,7 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Search
@@ -82,6 +85,7 @@ import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.VpnLock
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -141,6 +145,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
@@ -205,6 +210,26 @@ private fun fontFamilyFor(name: String): FontFamily = when (name) {
     else -> FontFamily.Default
 }
 
+private fun isTailscaleLike(url: String): Boolean {
+    val host = runCatching { java.net.URI(url).host }.getOrNull()?.lowercase() ?: return false
+    if (host.endsWith(".ts.net")) return true
+    val parts = host.split('.')
+    if (parts.size == 4 && parts[0] == "100") {
+        val second = parts[1].toIntOrNull() ?: return false
+        return second in 64..127
+    }
+    return false
+}
+
+private fun speechUrlFor(baseUrl: String): String {
+    val base = baseUrl.trim().trimEnd('/')
+    if (base.isBlank()) return ""
+    if (base.contains("gmpony.alfanomy.ru")) return "$base/speech/inference"
+    val host = runCatching { java.net.URI(base).host }.getOrNull()
+    if (!host.isNullOrBlank()) return "http://$host:18080/inference"
+    return "$base/speech/inference"
+}
+
 private fun prettyModel(id: String): String =
     id.split('-').filter { it.isNotBlank() }.joinToString(" ") { w ->
         val c = w.replaceFirstChar { it.uppercase() }
@@ -261,6 +286,11 @@ private fun App() {
     LaunchedEffect(screen) { prefs.lastScreen = screen.name }
 
     var baseUrl by remember { mutableStateOf(prefs.baseUrl) }
+    var tailscaleUrl by remember { mutableStateOf(prefs.tailscaleUrl) }
+    var connectionMode by remember { mutableStateOf(prefs.connectionMode) }
+    var speechUrl by remember { mutableStateOf(prefs.speechUrl) }
+    var activeBaseUrl by remember { mutableStateOf(prefs.activeBaseUrl) }
+    var activeKind by remember { mutableStateOf(prefs.activeKind) }
     var user by remember { mutableStateOf(prefs.user) }
     var password by remember { mutableStateOf(prefs.password) }
     var themeMode by remember { mutableStateOf(prefs.themeMode) }
@@ -316,6 +346,11 @@ private fun App() {
     var filesReturnScreen by remember { mutableStateOf(Screen.SESSIONS) }
     var showMentionPicker by remember { mutableStateOf(false) }
     var pickedMentions by remember { mutableStateOf<List<String>>(emptyList()) }
+    val wavRecorder = remember { WavRecorder(context) }
+    var recording by remember { mutableStateOf(false) }
+    var transcribing by remember { mutableStateOf(false) }
+    var recordSeconds by remember { mutableStateOf(0) }
+    var micStartRequested by remember { mutableStateOf(false) }
     var changes by remember { mutableStateOf<List<FileChange>>(emptyList()) }
     var showChanges by remember { mutableStateOf(false) }
 
@@ -343,7 +378,66 @@ private fun App() {
     fun liveTextOf(partId: String): String = (liveParts[partId] as? TextBlock)?.text ?: ""
     val streamRef = remember { mutableStateOf<EventStream?>(null) }
 
-    fun client() = ApiClient(prefs.baseUrl, prefs.user, prefs.password)
+    fun client() = ApiClient(
+        prefs.activeBaseUrl.ifBlank { prefs.baseUrl },
+        prefs.user, prefs.password,
+        prefs.activeSpeechUrl
+    )
+
+    suspend fun resolveConnection(): Boolean {
+        val mode = prefs.connectionMode
+        val pub = prefs.baseUrl.trim().trimEnd('/')
+        val ts = prefs.tailscaleUrl.trim().trimEnd('/')
+        val cached = prefs.activeBaseUrl.trim().trimEnd('/')
+
+        suspend fun pingUrl(url: String, timeoutMs: Int): Boolean =
+            url.isNotBlank() && withContext(Dispatchers.IO) {
+                runCatching {
+                    ApiClient(url, prefs.user, prefs.password).ping(timeoutMs)
+                }.getOrDefault(false)
+            }
+
+        val chosen = when (mode) {
+            "public" -> when {
+                pingUrl(pub, 4000) -> pub
+                pingUrl(ts, 3000) -> ts
+                else -> ""
+            }
+            "tailscale" -> when {
+                pingUrl(ts, 4000) -> ts
+                pingUrl(pub, 3000) -> pub
+                else -> ""
+            }
+            else -> {
+                var result = ""
+                if (pingUrl(ts, 1500)) result = ts
+                if (result.isBlank() && cached.isNotBlank() && cached != ts &&
+                    pingUrl(cached, 1500)
+                ) result = cached
+                if (result.isBlank() && pub.isNotBlank() && pub != ts && pub != cached &&
+                    pingUrl(pub, 2500)
+                ) result = pub
+                if (result.isBlank() && pub.isNotBlank()) result = pub
+                result
+            }
+        }
+
+        if (chosen.isBlank()) return false
+        prefs.activeBaseUrl = chosen
+        activeBaseUrl = chosen
+        val kind = when {
+            ts.isNotBlank() && chosen == ts -> "tailscale"
+            pub.isNotBlank() && chosen == pub -> "public"
+            isTailscaleLike(chosen) -> "tailscale"
+            else -> "public"
+        }
+        prefs.activeKind = kind
+        activeKind = kind
+        prefs.activeSpeechUrl =
+            if (prefs.speechUrl.isNotBlank()) prefs.speechUrl.trim()
+            else speechUrlFor(chosen)
+        return true
+    }
 
     fun run(block: suspend () -> Unit) {
         scope.launch {
@@ -846,6 +940,90 @@ private fun App() {
         return out
     }
 
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) micStartRequested = true
+        else status = "Нет разрешения на микрофон"
+    }
+
+    fun startMicRecording() {
+        if (recording || transcribing) return
+        if (!wavRecorder.hasPermission()) {
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        if (wavRecorder.start()) {
+            recording = true
+            recordSeconds = 0
+            status = ""
+        } else {
+            status = "Не удалось начать запись"
+        }
+    }
+
+    fun stopMicRecording() {
+        if (!recording) return
+        recording = false
+        transcribing = true
+        status = ""
+        scope.launch {
+            val wav = withContext(Dispatchers.IO) { wavRecorder.stop() }
+            if (wav == null) {
+                status = "Слишком короткая запись"
+                transcribing = false
+                return@launch
+            }
+            try {
+                val text = withContext(Dispatchers.IO) { client().transcribe(wav) }
+                if (text.isBlank()) {
+                    status = "Не удалось распознать речь"
+                } else {
+                    input = if (input.isBlank()) text else input.trimEnd() + " " + text
+                }
+            } catch (e: Exception) {
+                status = e.message ?: "Ошибка распознавания"
+            } finally {
+                transcribing = false
+            }
+        }
+    }
+
+    fun onMicTap() {
+        when {
+            transcribing -> {}
+            recording -> stopMicRecording()
+            else -> startMicRecording()
+        }
+    }
+
+    LaunchedEffect(recording) {
+        if (!recording) {
+            recordSeconds = 0
+            return@LaunchedEffect
+        }
+        val started = System.currentTimeMillis()
+        while (true) {
+            delay(500)
+            recordSeconds = ((System.currentTimeMillis() - started) / 1000).toInt()
+            if (recordSeconds >= WavRecorder.MAX_SECONDS) {
+                stopMicRecording()
+                break
+            }
+        }
+    }
+
+    LaunchedEffect(micStartRequested) {
+        if (micStartRequested) {
+            micStartRequested = false
+            startMicRecording()
+        }
+    }
+
+    DisposableEffect(wavRecorder) {
+        onDispose { wavRecorder.cancel() }
+    }
+
     fun send() {
         val text = input.trim()
         val s = current ?: return
@@ -952,6 +1130,8 @@ private fun App() {
     LaunchedEffect(Unit) {
         if (!prefs.isConfigured()) return@LaunchedEffect
         try {
+            val connected = resolveConnection()
+            if (!connected && status.isBlank()) status = "Сервер недоступен"
             // Списки грузим сразу и параллельно, чтобы не тормозить показ чата.
             val projectsJob = async(Dispatchers.IO) { collectProjects() }
             val modelsJob = async(Dispatchers.IO) {
@@ -1027,8 +1207,11 @@ private fun App() {
     val activity = context.findMainActivity()
     DisposableEffect(activity) {
         activity?.resumeHandler = {
-            if (screen == Screen.CHAT) {
-                current?.let { s -> resumeSession(s.id) }
+            scope.launch {
+                resolveConnection()
+                if (screen == Screen.CHAT) {
+                    current?.let { s -> resumeSession(s.id) }
+                }
             }
         }
         onDispose { activity?.resumeHandler = null }
@@ -1072,26 +1255,41 @@ private fun App() {
                 Screen.SETTINGS -> SettingsScreen(
                     baseUrl = baseUrl, user = user, password = password,
                     busy = busy, status = status,
+                    tailscaleUrl = tailscaleUrl, connectionMode = connectionMode,
+                    speechUrl = speechUrl, activeBaseUrl = activeBaseUrl,
                     themeMode = themeMode, fontName = fontName, fontScale = fontScale,
                     onThemeMode = { themeMode = it; prefs.themeMode = it },
                     onFontName = { fontName = it; prefs.fontFamily = it },
                     onFontScale = { fontScale = it; prefs.fontScale = it },
+                    onTailscaleUrl = { tailscaleUrl = it },
+                    onConnectionMode = { connectionMode = it },
+                    onSpeechUrl = { speechUrl = it },
                     onBack = if (prefs.isConfigured()) ({ screen = settingsFrom }) else null,
                     onBaseUrl = { baseUrl = it }, onUser = { user = it }, onPassword = { password = it },
                     onSave = {
                         prefs.baseUrl = baseUrl.trim()
+                        prefs.tailscaleUrl = tailscaleUrl.trim()
+                        prefs.connectionMode = connectionMode
+                        prefs.speechUrl = speechUrl.trim()
                         prefs.user = user.trim()
                         prefs.password = password
+                        prefs.activeBaseUrl = ""
+                        activeBaseUrl = ""
                         run {
-                            val health = withContext(Dispatchers.IO) { client().health() }
-                            prefs.providerId = "opencode"
-                            prefs.modelId = "deepseek-v4.1-flash"
-                            providerId = "opencode"
-                            modelId = "deepseek-v4.1-flash"
-                            projects = withContext(Dispatchers.IO) { collectProjects() }
-                            status = "Связь есть: $health"
-                            screen = Screen.PROJECTS
-                            loadModels()
+                            val ok = resolveConnection()
+                            if (!ok) {
+                                status = "Сервер недоступен"
+                            } else {
+                                val health = withContext(Dispatchers.IO) { client().health() }
+                                prefs.providerId = "opencode"
+                                prefs.modelId = "deepseek-v4.1-flash"
+                                providerId = "opencode"
+                                modelId = "deepseek-v4.1-flash"
+                                projects = withContext(Dispatchers.IO) { collectProjects() }
+                                status = "Связь есть: $health (${prefs.activeBaseUrl})"
+                                screen = Screen.PROJECTS
+                                loadModels()
+                            }
                         }
                     }
                 )
@@ -1131,6 +1329,9 @@ private fun App() {
                     variant = variant,
                     contextUsed = contextUsed, contextLimit = contextLimit,
                     commands = commands,
+                    recording = recording, recordSeconds = recordSeconds, transcribing = transcribing,
+                    onMic = { onMicTap() },
+                    connectionKind = activeKind,
                     onInput = { v ->
                         input = v
                         if (v.endsWith("@") && !showMentionPicker) showMentionPicker = true
@@ -1150,7 +1351,8 @@ private fun App() {
 
                 Screen.FILES -> FilesScreen(
                     directory = current?.directory?.ifBlank { directory } ?: directory,
-                    baseUrl = prefs.baseUrl, user = prefs.user, password = prefs.password,
+                    baseUrl = activeBaseUrl.ifBlank { prefs.baseUrl },
+                    user = prefs.user, password = prefs.password,
                     onBack = { screen = filesReturnScreen }
                 )
             }
@@ -1308,7 +1510,8 @@ private fun App() {
     if (showMentionPicker) {
         MentionPickerDialog(
             directory = current?.directory?.ifBlank { directory } ?: directory,
-            baseUrl = prefs.baseUrl, user = prefs.user, password = prefs.password,
+            baseUrl = activeBaseUrl.ifBlank { prefs.baseUrl },
+            user = prefs.user, password = prefs.password,
             onDismiss = { showMentionPicker = false },
             onPick = { path ->
                 input = if (input.endsWith("@")) input.dropLast(1) + "@" + path + " "
@@ -1331,8 +1534,10 @@ private fun App() {
 @Composable
 private fun SettingsScreen(
     baseUrl: String, user: String, password: String, busy: Boolean, status: String,
+    tailscaleUrl: String, connectionMode: String, speechUrl: String, activeBaseUrl: String,
     themeMode: String, fontName: String, fontScale: Float,
     onThemeMode: (String) -> Unit, onFontName: (String) -> Unit, onFontScale: (Float) -> Unit,
+    onTailscaleUrl: (String) -> Unit, onConnectionMode: (String) -> Unit, onSpeechUrl: (String) -> Unit,
     onBack: (() -> Unit)?,
     onBaseUrl: (String) -> Unit, onUser: (String) -> Unit, onPassword: (String) -> Unit,
     onSave: () -> Unit
@@ -1401,11 +1606,50 @@ private fun SettingsScreen(
                 steps = 5
             )
             Spacer(Modifier.height(20.dp))
+            Text("Подключение", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            Spacer(Modifier.height(8.dp))
+            Text("Режим", fontWeight = FontWeight.Bold)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf(
+                    "auto" to "Авто", "public" to "Публичный", "tailscale" to "Tailscale"
+                ).forEach { (value, label) ->
+                    FilterChip(
+                        selected = connectionMode == value,
+                        onClick = { onConnectionMode(value) },
+                        label = { Text(label) }
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Text("Публичный адрес", fontWeight = FontWeight.Bold)
+            OutlinedTextField(
+                baseUrl, onBaseUrl, Modifier.fillMaxWidth(), singleLine = true,
+                placeholder = { Text("https://gmpony.alfanomy.ru") }
+            )
+            Spacer(Modifier.height(10.dp))
+            Text("Адрес по Tailscale", fontWeight = FontWeight.Bold)
+            OutlinedTextField(
+                tailscaleUrl, onTailscaleUrl, Modifier.fillMaxWidth(), singleLine = true,
+                placeholder = { Text("http://100.75.84.42:4096") }
+            )
+            Spacer(Modifier.height(10.dp))
+            Text("Адрес распознавания речи (необязательно)", fontWeight = FontWeight.Bold)
+            OutlinedTextField(
+                speechUrl, onSpeechUrl, Modifier.fillMaxWidth(), singleLine = true,
+                placeholder = { Text("пусто — определится автоматически") }
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                if (activeBaseUrl.isBlank()) "Сейчас: ещё не определён" else "Сейчас: $activeBaseUrl",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(20.dp))
             Text("Сервер", fontWeight = FontWeight.Bold, fontSize = 18.sp)
             Spacer(Modifier.height(8.dp))
-            Text("Адрес сервера opencode", fontWeight = FontWeight.Bold)
-            OutlinedTextField(baseUrl, onBaseUrl, Modifier.fillMaxWidth(), singleLine = true, placeholder = { Text("https://gmpony.alfanomy.ru") })
-            Spacer(Modifier.height(12.dp))
             Text("Логин", fontWeight = FontWeight.Bold)
             OutlinedTextField(user, onUser, Modifier.fillMaxWidth(), singleLine = true)
             Spacer(Modifier.height(12.dp))
@@ -2087,6 +2331,9 @@ private fun ChatScreen(
     onPickCommand: (String) -> Unit,
     onSelectVariant: (String) -> Unit,
     onAttach: (Uri) -> Unit, onRemoveAttachment: (Int) -> Unit,
+    recording: Boolean, recordSeconds: Int, transcribing: Boolean,
+    onMic: () -> Unit,
+    connectionKind: String,
     onOpenFiles: () -> Unit,
     onBack: () -> Unit, onSettings: () -> Unit
 ) {
@@ -2157,9 +2404,10 @@ private fun ChatScreen(
                 }
                 Row(
                     Modifier.fillMaxWidth().padding(end = 4.dp),
-                    horizontalArrangement = Arrangement.End,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    ConnectionBadge(connectionKind)
+                    Spacer(Modifier.weight(1f))
                     Box {
                         TextButton(onClick = { variantMenu = true }) {
                             Text(variantLabel, fontSize = 13.sp)
@@ -2384,6 +2632,39 @@ private fun ChatScreen(
                     }
                 }
             }
+            if (recording) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.error)
+                    )
+                    Spacer(Modifier.size(8.dp))
+                    Text(
+                        "Запись ${recordSeconds} с — нажмите ■, чтобы остановить",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+            if (transcribing) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.size(8.dp))
+                    Text(
+                        "Распознаю речь…",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -2391,29 +2672,66 @@ private fun ChatScreen(
                     .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(24.dp))
                     .padding(horizontal = 8.dp, vertical = 8.dp)
             ) {
-                BasicTextField(
-                    value = input,
-                    onValueChange = onInput,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp),
-                    textStyle = TextStyle(
-                        fontSize = 15.sp,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        fontFamily = LocalTextStyle.current.fontFamily
-                    ),
-                    maxLines = 6,
-                    decorationBox = { inner ->
-                        Box(Modifier.fillMaxWidth()) {
-                            if (input.isEmpty()) {
-                                Text(
-                                    "Спросите что угодно, / — команды, @ — контекст…",
-                                    fontSize = 15.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                Box(Modifier.fillMaxWidth()) {
+                    BasicTextField(
+                        value = input,
+                        onValueChange = onInput,
+                        modifier = Modifier.fillMaxWidth().padding(start = 6.dp, end = 48.dp),
+                        textStyle = TextStyle(
+                            fontSize = 15.sp,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontFamily = LocalTextStyle.current.fontFamily
+                        ),
+                        maxLines = 6,
+                        decorationBox = { inner ->
+                            Box(Modifier.fillMaxWidth()) {
+                                if (input.isEmpty()) {
+                                    Text(
+                                        "Спросите что угодно, / — команды, @ — контекст…",
+                                        fontSize = 15.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                inner()
                             }
-                            inner()
+                        }
+                    )
+                    if (transcribing) {
+                        Box(
+                            Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(top = 2.dp, end = 2.dp)
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.error),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(
+                                Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onError
+                            )
+                        }
+                    } else {
+                        Box(
+                            Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(top = 2.dp, end = 2.dp)
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.error)
+                                .clickable { onMic() },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                if (recording) Icons.Filled.Stop else Icons.Filled.Mic,
+                                contentDescription = if (recording) "Остановить запись" else "Голосовой ввод",
+                                tint = MaterialTheme.colorScheme.onError,
+                                modifier = Modifier.size(20.dp)
+                            )
                         }
                     }
-                )
+                }
                 Spacer(Modifier.height(6.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box {
@@ -2436,22 +2754,41 @@ private fun ChatScreen(
                     }
                     Spacer(Modifier.size(6.dp))
                     Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-                        Box(
+                        BoxWithConstraints(
                             Modifier
                                 .weight(1f, fill = false)
                                 .clip(RoundedCornerShape(18.dp))
                                 .background(MaterialTheme.colorScheme.surface)
                                 .clickable { onOpenModelPicker() }
-                                .padding(horizontal = 14.dp, vertical = 8.dp)
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
                         ) {
+                            val density = LocalDensity.current
+                            val measurer = rememberTextMeasurer()
+                            val arrowPx = with(density) { 18.dp.toPx() }
+                            val gapPx = with(density) { 2.dp.toPx() }
+                            val availablePx = with(density) { maxWidth.toPx() } - arrowPx - gapPx
+                            val baseStyle = MaterialTheme.typography.bodyMedium.copy(
+                                fontSize = 14.sp,
+                                fontFamily = LocalTextStyle.current.fontFamily
+                            )
+                            val measured = measurer.measure(
+                                AnnotatedString(currentModelName),
+                                style = baseStyle,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                            val fit = if (measured.size.width > 0)
+                                (availablePx / measured.size.width).coerceIn(0f, 1f) else 1f
+                            val fittedSize = (14f * fit).coerceAtLeast(8f).sp
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     currentModelName,
-                                    fontSize = 14.sp,
+                                    fontSize = fittedSize,
                                     maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f, fill = false)
+                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis
                                 )
+                                Spacer(Modifier.size(2.dp))
                                 Icon(Icons.Filled.ExpandMore, contentDescription = null, modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
@@ -2462,7 +2799,7 @@ private fun ChatScreen(
                     } else {
                         CircleButton(
                             icon = Icons.Filled.ArrowUpward,
-                            enabled = input.isNotBlank() || attachments.isNotEmpty(),
+                            enabled = (input.isNotBlank() || attachments.isNotEmpty()) && !recording && !transcribing,
                             filled = true
                         ) { onSend() }
                     }
@@ -2600,6 +2937,36 @@ private fun FormDialog(
             TextButton(onClick = onCancel) { Text("Отклонить") }
         }
     )
+}
+
+@Composable
+private fun ConnectionBadge(kind: String) {
+    if (kind.isBlank()) return
+    val ts = kind == "tailscale"
+    val bg = if (ts) MaterialTheme.colorScheme.primaryContainer
+    else MaterialTheme.colorScheme.surfaceVariant
+    val fg = if (ts) MaterialTheme.colorScheme.onPrimaryContainer
+    else MaterialTheme.colorScheme.onSurfaceVariant
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(bg)
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            if (ts) Icons.Filled.VpnLock else Icons.Filled.Language,
+            contentDescription = null,
+            modifier = Modifier.size(14.dp),
+            tint = fg
+        )
+        Spacer(Modifier.size(4.dp))
+        Text(
+            if (ts) "Tailscale" else "Интернет",
+            fontSize = 11.sp,
+            color = fg
+        )
+    }
 }
 
 @Composable
@@ -2929,34 +3296,67 @@ private fun ModelManageDialog(
     onHideAll: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    val grouped = models.groupBy { it.providerName }.toSortedMap()
+    var query by remember { mutableStateOf("") }
+    val filtered = models.filter {
+        query.isBlank() ||
+            it.name.contains(query, ignoreCase = true) ||
+            it.modelId.contains(query, ignoreCase = true) ||
+            it.providerName.contains(query, ignoreCase = true)
+    }
+    val grouped = filtered.groupBy { it.providerName }.toSortedMap()
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Модели") },
         text = {
-            Column(Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState())) {
+            Column(Modifier.heightIn(max = 480.dp)) {
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    placeholder = { Text("Поиск моделей") },
+                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                    trailingIcon = {
+                        if (query.isNotBlank()) {
+                            IconButton(onClick = { query = "" }) {
+                                Icon(Icons.Filled.Close, contentDescription = "Очистить")
+                            }
+                        }
+                    }
+                )
+                Spacer(Modifier.height(4.dp))
                 Text(
                     "Отметьте модели, которые показывать в выборе.",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(Modifier.height(8.dp))
-                grouped.forEach { (provider, list) ->
-                    Text(
-                        provider, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
-                    )
-                    list.forEach { mi ->
-                        val key = mi.providerId + "/" + mi.modelId
-                        val visible = key !in hidden
-                        Row(
-                            Modifier.fillMaxWidth().clickable { onToggle(mi) }.padding(vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                if (visible) "☑  " else "☐  ",
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                            Text(mi.name, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                Spacer(Modifier.height(4.dp))
+                Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState())) {
+                    if (filtered.isEmpty()) {
+                        Text(
+                            "Ничего не найдено",
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(8.dp)
+                        )
+                    }
+                    grouped.forEach { (provider, list) ->
+                        Text(
+                            provider, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+                        )
+                        list.forEach { mi ->
+                            val key = mi.providerId + "/" + mi.modelId
+                            val visible = key !in hidden
+                            Row(
+                                Modifier.fillMaxWidth().clickable { onToggle(mi) }.padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    if (visible) "☑  " else "☐  ",
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(mi.name, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                            }
                         }
                     }
                 }

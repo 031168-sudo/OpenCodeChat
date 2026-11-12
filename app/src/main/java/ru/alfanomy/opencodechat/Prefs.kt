@@ -9,6 +9,30 @@ class Prefs(context: Context) {
         get() = sp.getString("baseUrl", "https://gmpony.alfanomy.ru") ?: ""
         set(v) = sp.edit().putString("baseUrl", v).apply()
 
+    var tailscaleUrl: String
+        get() = sp.getString("tailscaleUrl", "http://100.75.84.42:4096") ?: ""
+        set(v) = sp.edit().putString("tailscaleUrl", v).apply()
+
+    var connectionMode: String
+        get() = sp.getString("connectionMode", "auto") ?: "auto"
+        set(v) = sp.edit().putString("connectionMode", v).apply()
+
+    var speechUrl: String
+        get() = sp.getString("speechUrl", "") ?: ""
+        set(v) = sp.edit().putString("speechUrl", v).apply()
+
+    var activeBaseUrl: String
+        get() = sp.getString("activeBaseUrl", "") ?: ""
+        set(v) = sp.edit().putString("activeBaseUrl", v).apply()
+
+    var activeSpeechUrl: String
+        get() = sp.getString("activeSpeechUrl", "") ?: ""
+        set(v) = sp.edit().putString("activeSpeechUrl", v).apply()
+
+    var activeKind: String
+        get() = sp.getString("activeKind", "") ?: ""
+        set(v) = sp.edit().putString("activeKind", v).apply()
+
     var user: String
         get() = sp.getString("user", "opencode") ?: ""
         set(v) = sp.edit().putString("user", v).apply()

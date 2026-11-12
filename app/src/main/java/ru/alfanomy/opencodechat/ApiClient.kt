@@ -144,10 +144,22 @@ fun parseToolBlock(p: JSONObject): ToolBlock {
 class ApiClient(
     private val baseUrl: String,
     private val user: String,
-    private val password: String
+    private val password: String,
+    private val speechUrl: String = ""
 ) {
     private fun authHeader(): String =
         "Basic " + Base64.encodeToString("$user:$password".toByteArray(), Base64.NO_WRAP)
+
+    fun ping(timeoutMs: Int): Boolean {
+        val conn = URL(baseUrl.trimEnd('/') + "/api/info").openConnection() as HttpURLConnection
+        conn.requestMethod = "GET"
+        conn.connectTimeout = timeoutMs
+        conn.readTimeout = timeoutMs
+        conn.setRequestProperty("Authorization", authHeader())
+        val ok = runCatching { conn.responseCode in 200..299 }.getOrDefault(false)
+        conn.disconnect()
+        return ok
+    }
 
     private fun request(path: String, method: String, body: JSONObject? = null, directory: String? = null): String {
         var full = baseUrl.trimEnd('/') + path
@@ -512,6 +524,40 @@ class ApiClient(
             body.put("files", arr)
         }
         request("/api/session/$sessionId/prompt", "POST", body)
+    }
+
+    fun transcribe(wav: ByteArray): String {
+        val boundary = "----OpenCodeSpeech" + System.nanoTime()
+        val endpoint = if (speechUrl.isNotBlank()) {
+            speechUrl.trim()
+        } else {
+            baseUrl.trimEnd('/') + "/speech/inference"
+        }
+        val sep = if (endpoint.contains('?')) "&" else "?"
+        val url = URL(endpoint + sep + "language=ru&response_format=json")
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.connectTimeout = 15000
+        conn.readTimeout = 120000
+        conn.doOutput = true
+        conn.setRequestProperty("Authorization", authHeader())
+        conn.setRequestProperty("Accept", "application/json")
+        conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+        conn.outputStream.buffered().use { out ->
+            fun write(s: String) = out.write(s.toByteArray(Charsets.UTF_8))
+            write("--$boundary\r\n")
+            write("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n")
+            write("Content-Type: audio/wav\r\n\r\n")
+            out.write(wav)
+            write("\r\n--$boundary--\r\n")
+        }
+        val code = conn.responseCode
+        val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)
+            ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+        conn.disconnect()
+        if (code !in 200..299) throw RuntimeException("HTTP $code: ${resp.take(300)}")
+        val parsed = runCatching { JSONObject(resp).optString("text") }.getOrDefault("")
+        return (if (parsed.isNotBlank()) parsed else resp).trim()
     }
 
     fun sendCommand(sessionId: String, name: String, text: String, providerId: String, modelId: String, variant: String?, agent: String?) {
