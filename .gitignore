@@ -1,0 +1,29 @@
+# Gradle / build
+.gradle/
+.kotlin/
+build/
+**/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Local configuration
+local.properties
+keystore.properties
+
+# Signing
+*.jks
+*.keystore
+
+# APK / bundles
+*.apk
+*.aab
+
+# OS / logs
+.DS_Store
+Thumbs.db
+*.log
