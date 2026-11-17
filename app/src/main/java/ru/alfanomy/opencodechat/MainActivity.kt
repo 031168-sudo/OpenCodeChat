@@ -1,6 +1,7 @@
 package ru.alfanomy.opencodechat
 
 import android.app.Activity
+import android.app.DatePickerDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -11,11 +12,14 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.text.format.DateFormat
 import android.util.Base64
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -57,9 +61,11 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Checklist
@@ -76,6 +82,9 @@ import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Search
@@ -87,6 +96,7 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.VpnLock
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -100,6 +110,7 @@ import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
@@ -121,7 +132,10 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -155,18 +169,73 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.io.File
+import java.util.Calendar
+import java.util.Date
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
 private enum class Screen { SETTINGS, PROJECTS, SESSIONS, CHAT, FILES }
+
+private enum class UsagePeriod { DAY, MONTH, ALL, CUSTOM }
+
+private fun startOfDay(ms: Long): Long {
+    val c = Calendar.getInstance()
+    c.timeInMillis = ms
+    c.set(Calendar.HOUR_OF_DAY, 0)
+    c.set(Calendar.MINUTE, 0)
+    c.set(Calendar.SECOND, 0)
+    c.set(Calendar.MILLISECOND, 0)
+    return c.timeInMillis
+}
+
+private fun endOfDay(ms: Long): Long = startOfDay(ms) + 24L * 60 * 60 * 1000 - 1
+
+private fun startOfMonth(ms: Long): Long {
+    val c = Calendar.getInstance()
+    c.timeInMillis = ms
+    c.set(Calendar.DAY_OF_MONTH, 1)
+    return startOfDay(c.timeInMillis)
+}
+
+private fun endOfMonth(ms: Long): Long {
+    val c = Calendar.getInstance()
+    c.timeInMillis = ms
+    c.set(Calendar.DAY_OF_MONTH, c.getActualMaximum(Calendar.DAY_OF_MONTH))
+    return endOfDay(c.timeInMillis)
+}
+
+private fun usageRange(period: UsagePeriod, customStart: Long, customEnd: Long): Pair<Long?, Long?> =
+    when (period) {
+        UsagePeriod.DAY -> {
+            val now = System.currentTimeMillis()
+            startOfDay(now) to endOfDay(now)
+        }
+        UsagePeriod.MONTH -> {
+            val now = System.currentTimeMillis()
+            startOfMonth(now) to endOfMonth(now)
+        }
+        UsagePeriod.ALL -> null to null
+        UsagePeriod.CUSTOM -> {
+            val a = startOfDay(customStart)
+            val b = endOfDay(customEnd)
+            if (a <= b) a to b else b to a
+        }
+    }
+
+private fun fmtDay(ms: Long): String =
+    java.text.SimpleDateFormat("dd.MM.yyyy", java.util.Locale.getDefault()).format(java.util.Date(ms))
 
 private enum class SessionAction { RENAME, UNDO, COMPACT, FORK, BACKGROUND, CHANGES, USAGE, EXPORT, DELETE }
 
@@ -296,11 +365,22 @@ private fun App() {
     var themeMode by remember { mutableStateOf(prefs.themeMode) }
     var fontName by remember { mutableStateOf(prefs.fontFamily) }
     var fontScale by remember { mutableStateOf(prefs.fontScale) }
+    var profiles by remember { mutableStateOf(prefs.profiles) }
+    var activeProfileId by remember { mutableStateOf(prefs.activeProfileId) }
+    var profileSyncError by remember { mutableStateOf("") }
+    var profileSyncing by remember { mutableStateOf(false) }
+    val profileSyncMutex = remember { Mutex() }
+    var scopePath by remember {
+        mutableStateOf(prefs.profiles.firstOrNull { it.id == prefs.activeProfileId }?.root?.trimEnd('/') ?: "")
+    }
 
     var projects by remember { mutableStateOf<List<Project>>(emptyList()) }
     var directory by remember { mutableStateOf(prefs.directory) }
     var sessions by remember { mutableStateOf<List<ChatSession>>(emptyList()) }
     var messages by remember { mutableStateOf(cachedMessages ?: emptyList()) }
+    var historyCursor by remember { mutableStateOf<String?>(null) }
+    var historyLoading by remember { mutableStateOf(false) }
+    var historyHasMore by remember { mutableStateOf(true) }
     var current by remember {
         mutableStateOf<ChatSession?>(
             if (hasLast) ChatSession(prefs.lastSessionId, prefs.lastSessionTitle.ifBlank { "Сессия" }, prefs.directory)
@@ -321,6 +401,7 @@ private fun App() {
     var showNewProject by remember { mutableStateOf(false) }
     var newParent by remember { mutableStateOf(prefs.parentDir) }
     var newName by remember { mutableStateOf("") }
+    var newProjectError by remember { mutableStateOf("") }
     var settingsFrom by remember { mutableStateOf(Screen.PROJECTS) }
 
     var models by remember { mutableStateOf<List<ModelInfo>>(emptyList()) }
@@ -343,6 +424,13 @@ private fun App() {
     var showUsage by remember { mutableStateOf(false) }
     var projectUsage by remember { mutableStateOf<ProjectUsage?>(null) }
     var showProjectUsage by remember { mutableStateOf(false) }
+    var projectUsageIsProfile by remember { mutableStateOf(false) }
+    var projectUsagePeriod by remember { mutableStateOf(UsagePeriod.MONTH) }
+    var projectUsageCustomStart by remember { mutableStateOf(startOfMonth(System.currentTimeMillis())) }
+    var projectUsageCustomEnd by remember { mutableStateOf(System.currentTimeMillis()) }
+    var projectUsageLoading by remember { mutableStateOf(false) }
+    var projectUsageRequest by remember { mutableStateOf(0) }
+    var projectUsageDirectory by remember { mutableStateOf("") }
     var filesReturnScreen by remember { mutableStateOf(Screen.SESSIONS) }
     var showMentionPicker by remember { mutableStateOf(false) }
     var pickedMentions by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -474,15 +562,72 @@ private fun App() {
         sessions = withContext(Dispatchers.IO) { client().listSessions(directory) }
     }
 
+    fun loadOlderMessages() {
+        val s = current ?: return
+        if (historyLoading || !historyHasMore) return
+        historyLoading = true
+        val cursor = historyCursor
+        scope.launch {
+            val page = withContext(Dispatchers.IO) {
+                runCatching { client().messagePage(s.id, cursor) }.getOrNull()
+            }
+            if (current?.id != s.id) {
+                historyLoading = false
+                return@launch
+            }
+            if (page != null) {
+                val (older, next) = page
+                if (older.isNotEmpty()) {
+                    messages = (messages + older)
+                        .distinctBy { it.id }
+                        .sortedBy { it.created }
+                }
+                historyCursor = next
+                historyHasMore = next != null && older.isNotEmpty()
+            }
+            historyLoading = false
+        }
+    }
+
+    fun mergeHistory(old: List<ChatMessage>, fresh: List<ChatMessage>): List<ChatMessage> {
+        // После каждого шага сервер отдаёт только последний вопрос и ответы.
+        // Объединяем со старым списком, чтобы уже показанные вопросы и
+        // подгруженная вверх история не исчезали. Локальный «пузырь» вопроса
+        // убираем, когда сервер вернул настоящий user-message.
+        val freshHasUser = fresh.any { it.role == "user" }
+        val newestFreshUser = fresh.filter { it.role == "user" }.maxOfOrNull { it.created } ?: 0L
+        val base = if (freshHasUser) {
+            old.filterNot { it.id.startsWith("local-") && it.created <= newestFreshUser }
+        } else old
+        return (fresh + base).distinctBy { it.id }.sortedBy { it.created }
+    }
+
+    fun loadProjectUsage() {
+        val dir = projectUsageDirectory
+        val recursive = projectUsageIsProfile
+        val (from, to) = usageRange(projectUsagePeriod, projectUsageCustomStart, projectUsageCustomEnd)
+        projectUsageRequest += 1
+        val request = projectUsageRequest
+        projectUsageLoading = true
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { client().projectUsage(dir, recursive, from, to) }.getOrNull()
+            }
+            if (request == projectUsageRequest) {
+                projectUsage = result
+                projectUsageLoading = false
+            }
+        }
+    }
+
     fun openProjectUsage() {
         val dir = directory
         if (dir.isBlank()) return
-        run {
-            projectUsage = withContext(Dispatchers.IO) {
-                runCatching { client().projectUsage(dir) }.getOrNull()
-            }
-            showProjectUsage = true
-        }
+        projectUsageDirectory = dir
+        projectUsageIsProfile = false
+        projectUsage = null
+        showProjectUsage = true
+        loadProjectUsage()
     }
 
     fun loadModels() {
@@ -556,6 +701,214 @@ private fun App() {
 
     val watchJob = remember { mutableStateOf<Job?>(null) }
 
+    fun switchProfile(id: String) {
+        if (id == prefs.activeProfileId) {
+            // Повторный выбор профиля возвращает из общего списка в его корень.
+            scopePath = prefs.profiles.firstOrNull { it.id == id }?.root?.trimEnd('/') ?: ""
+            return
+        }
+        watchJob.value?.cancel()
+        watchJob.value = null
+        stopStream()
+        prefs.activeProfileId = id
+        activeProfileId = id
+        val p = prefs.profiles.firstOrNull { it.id == id }
+        scopePath = p?.root?.trimEnd('/') ?: ""
+        // У профиля свои модель, агент, вариант и последняя сессия.
+        providerId = prefs.providerId
+        modelId = prefs.modelId
+        agent = prefs.agent
+        variant = prefs.variant
+        hiddenModels = prefs.hiddenModels
+        directory = prefs.directory
+        current = null
+        messages = emptyList()
+        input = ""
+        attachments = emptyList()
+        pickedMentions = emptyList()
+        showMentionPicker = false
+        liveAssistantId = null
+        liveClear()
+        busy = false
+        status = ""
+        pendingPermission = null
+        pendingForm = null
+        contextUsed = 0L
+        if (screen == Screen.CHAT || screen == Screen.SESSIONS || screen == Screen.FILES) {
+            screen = Screen.PROJECTS
+        }
+        if (screen == Screen.SETTINGS) settingsFrom = Screen.PROJECTS
+        loadProjects()
+    }
+
+    /**
+     * /profiles/api живёт на публичном прокси (там же, где веб-UI), поэтому
+     * синхронизацию всегда ведём через публичный адрес, даже если основные
+     * запросы идут по Tailscale.
+     */
+    fun profilesClient() = ApiClient(
+        prefs.baseUrl.trim().trimEnd('/').ifBlank {
+            prefs.activeBaseUrl.trim().trimEnd('/').ifBlank { "https://gmpony.alfanomy.ru" }
+        },
+        prefs.user, prefs.password
+    )
+
+    /**
+     * Забирает общий список профилей с сервера. При первом синке локальные
+     * профили (если они были до этой версии) добавляются на сервер, дальше
+     * сервер — источник истины. При ошибке остаётся локальный кэш.
+     */
+    suspend fun syncProfiles(): Boolean = profileSyncMutex.withLock {
+        profileSyncing = true
+        try {
+            val api = profilesClient()
+            val remoteResult = withContext(Dispatchers.IO) {
+                runCatching { api.listProfiles() }
+            }
+            if (remoteResult.isFailure) {
+                profileSyncError = remoteResult.exceptionOrNull()?.message
+                    ?: "Не удалось загрузить профили"
+                return@withLock false
+            }
+            var remote = remoteResult.getOrThrow()
+
+            if (!prefs.profilesSynced) {
+                val local = prefs.profiles
+                val missing = local.filter { lp ->
+                    remote.none {
+                        it.name == lp.name &&
+                            it.root.trimEnd('/') == lp.root.trimEnd('/')
+                    }
+                }
+                if (missing.isNotEmpty()) {
+                    val saved = withContext(Dispatchers.IO) {
+                        missing.map { lp -> runCatching { api.saveProfile(lp.name, lp.root) } }
+                    }
+                    val failed = saved.firstOrNull { it.isFailure }
+                    if (failed != null) {
+                        profileSyncError = failed.exceptionOrNull()?.message
+                            ?: "Не удалось сохранить локальные профили"
+                        return@withLock false
+                    }
+                    remote = withContext(Dispatchers.IO) {
+                        runCatching { api.listProfiles() }.getOrDefault(remote)
+                    }
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                prefs.saveProfiles(remote)
+                prefs.profilesSynced = true
+                profiles = prefs.profiles
+                val active = prefs.activeProfileId
+                if (active.isNotBlank() && remote.none { it.id == active }) {
+                    prefs.activeProfileId = ""
+                    activeProfileId = ""
+                    scopePath = ""
+                } else {
+                    activeProfileId = prefs.activeProfileId
+                    scopePath = remote.firstOrNull { it.id == active }?.root?.trimEnd('/') ?: ""
+                }
+                profileSyncError = ""
+            }
+            true
+        } finally {
+            profileSyncing = false
+        }
+    }
+
+    fun addProfile(name: String, root: String) {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { profilesClient().saveProfile(name, root) }
+            }
+            val saved = result.getOrNull()
+            if (saved == null) {
+                profileSyncError = result.exceptionOrNull()?.message
+                    ?: "Не удалось сохранить профиль"
+                return@launch
+            }
+            syncProfiles()
+            if (prefs.profiles.none { it.id == saved.id }) {
+                prefs.saveProfiles(prefs.profiles + saved)
+                profiles = prefs.profiles
+            }
+            switchProfile(saved.id)
+        }
+    }
+
+    fun updateProfile(p: Profile) {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { profilesClient().saveProfile(p.name, p.root, p.id) }
+            }
+            val saved = result.getOrNull()
+            if (saved == null) {
+                profileSyncError = result.exceptionOrNull()?.message
+                    ?: "Не удалось сохранить профиль"
+                return@launch
+            }
+            // Если профиль был только локальным, сервер выдал новый id.
+            if (prefs.activeProfileId == p.id && saved.id != p.id) {
+                prefs.activeProfileId = saved.id
+                activeProfileId = saved.id
+            }
+            if (prefs.profiles.any { it.id == saved.id }) {
+                prefs.saveProfiles(prefs.profiles.map { if (it.id == saved.id) saved else it })
+            } else if (prefs.profiles.any { it.id == p.id }) {
+                prefs.saveProfiles(prefs.profiles.map { if (it.id == p.id) saved else it })
+            } else {
+                prefs.saveProfiles(prefs.profiles + saved)
+            }
+            profiles = prefs.profiles
+            syncProfiles()
+            if (prefs.activeProfileId == saved.id) {
+                scopePath = saved.root.trimEnd('/')
+                loadProjects()
+            }
+        }
+    }
+
+    fun deleteProfile(id: String) {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { profilesClient().deleteProfile(id) }
+            }
+            if (result.isFailure) {
+                profileSyncError = result.exceptionOrNull()?.message
+                    ?: "Не удалось удалить профиль"
+                return@launch
+            }
+            prefs.saveProfiles(prefs.profiles.filterNot { it.id == id })
+            profiles = prefs.profiles
+            syncProfiles()
+            if (prefs.activeProfileId == id) switchProfile("")
+        }
+    }
+
+    LaunchedEffect(screen) {
+        if (screen == Screen.SETTINGS) syncProfiles()
+    }
+
+    fun openProfileUsage() {
+        val root = profiles.firstOrNull { it.id == activeProfileId }?.root?.trimEnd('/') ?: ""
+        projectUsageDirectory = root
+        projectUsageIsProfile = true
+        projectUsage = null
+        showProjectUsage = true
+        loadProjectUsage()
+    }
+
+    fun scopeUp() {
+        if (scopePath.isBlank()) return
+        val p = parentPath(scopePath).trimEnd('/')
+        scopePath = p.ifBlank { "/" }
+    }
+
+    fun scopeToProfile() {
+        scopePath = profiles.firstOrNull { it.id == activeProfileId }?.root?.trimEnd('/') ?: ""
+    }
+
     /**
      * Если сессия уже выполняется на сервере (например, приложение открыли
      * заново, пока модель ещё думала), показываем спиннер и ждём завершения,
@@ -571,10 +924,10 @@ private fun App() {
                     if (active != true) break
                 }
             } finally {
-                val fresh = runCatching { client().messages(sessionId) }.getOrNull()
+                val fresh = runCatching { client().recentMessages(sessionId) }.getOrNull()
                 withContext(Dispatchers.Main) {
                     if (current?.id == sessionId) {
-                        if (fresh != null) messages = fresh
+                        if (fresh != null) messages = mergeHistory(messages, fresh)
                         busy = false
                         checkPending(sessionId)
                         refreshContext(sessionId)
@@ -598,9 +951,9 @@ private fun App() {
                     stopStream()
                     liveClear()
                     val fresh = withContext(Dispatchers.IO) {
-                        runCatching { client().messages(sessionId) }.getOrNull()
+                        runCatching { client().recentMessages(sessionId) }.getOrNull()
                     }
-                    if (fresh != null) messages = fresh
+                    if (fresh != null) messages = mergeHistory(messages, fresh)
                     busy = false
                 }
                 return@launch
@@ -610,10 +963,10 @@ private fun App() {
                 watchActive(sessionId)
             } else if (active == false) {
                 val fresh = withContext(Dispatchers.IO) {
-                    runCatching { client().messages(sessionId) }.getOrNull()
+                    runCatching { client().recentMessages(sessionId) }.getOrNull()
                 }
                 if (current?.id != sessionId) return@launch
-                if (fresh != null) messages = fresh
+                if (fresh != null) messages = mergeHistory(messages, fresh)
                 busy = false
                 checkPending(sessionId)
                 refreshContext(sessionId)
@@ -635,6 +988,9 @@ private fun App() {
         pendingPermission = null
         pendingForm = null
         messages = emptyList()
+        historyCursor = null
+        historyHasMore = true
+        historyLoading = false
         liveClear()
         contextUsed = if (prefs.contextSessionId == s.id) prefs.contextUsed else 0L
         run { messages = withContext(Dispatchers.IO) { client().messages(s.id) } }
@@ -651,12 +1007,72 @@ private fun App() {
         }
     }
 
+    /** Откатить сессию до указанного вопроса (включительно) и перечитать историю. */
+    fun revertToMessage(messageId: String) {
+        val s = current ?: return
+        scope.launch {
+            busy = true
+            try {
+                withContext(Dispatchers.IO) {
+                    client().revertStage(s.id, messageId)
+                    client().revertCommit(s.id)
+                }
+                val fresh = withContext(Dispatchers.IO) { client().messages(s.id) }
+                messages = fresh
+                historyCursor = null
+                historyHasMore = true
+                historyLoading = false
+            } catch (e: Exception) {
+                status = e.message ?: "Ошибка"
+            } finally {
+                busy = false
+            }
+        }
+    }
+
+    /**
+     * Короткая сводка настроек профиля для списка в настройках. Для
+     * активного профиля берём текущее состояние, для остальных — scoped prefs.
+     */
+    fun profileSummaryText(p: Profile): String {
+        val pid = if (p.id == activeProfileId) providerId else prefs.providerIdFor(p.id)
+        val mid = if (p.id == activeProfileId) modelId else prefs.modelIdFor(p.id)
+        val ag = if (p.id == activeProfileId) agent else prefs.agentFor(p.id)
+        val v = if (p.id == activeProfileId) variant else prefs.variantFor(p.id)
+        val hidden = if (p.id == activeProfileId) hiddenModels.size else prefs.hiddenModelsFor(p.id).size
+        val vLabel = if (v.isBlank() || v == "default") "Default" else v
+        val hiddenLabel = if (hidden > 0) " · скрыто: $hidden" else ""
+        return "$pid/$mid · $ag · $vLabel$hiddenLabel"
+    }
+
+    /**
+     * «Настроить» у профиля: активируем его и открываем последнюю сессию,
+     * где модель/агент/вариант меняются в шапке чата. Если сессии нет —
+     * остаёмся на проектах профиля.
+     */
+    fun configureProfile(id: String) {
+        if (id != prefs.activeProfileId) switchProfile(id)
+        val sid = prefs.lastSessionId
+        if (sid.isNotBlank()) {
+            openSession(
+                ChatSession(
+                    sid,
+                    prefs.lastSessionTitle.ifBlank { "Сессия" },
+                    prefs.directory
+                )
+            )
+        } else {
+            screen = Screen.PROJECTS
+        }
+    }
+
     fun streamSession(sessionId: String) {
         scope.launch(Dispatchers.IO) {
             val s = runCatching { client().openEventStream() }.getOrNull()
             if (s == null) {
                 withContext(Dispatchers.Main) {
-                    messages = withContext(Dispatchers.IO) { client().messages(sessionId) }
+                    val fresh = withContext(Dispatchers.IO) { client().recentMessages(sessionId) }
+                    messages = mergeHistory(messages, fresh)
                     busy = false
                 }
                 return@launch
@@ -709,7 +1125,8 @@ private fun App() {
                             }
                             withContext(Dispatchers.Main) {
                                 liveClear()
-                                messages = withContext(Dispatchers.IO) { client().messages(sessionId) }
+                                val fresh = withContext(Dispatchers.IO) { client().recentMessages(sessionId) }
+                                messages = mergeHistory(messages, fresh)
                             }
                         }
                         "session.step.failed" -> {
@@ -723,7 +1140,8 @@ private fun App() {
                             execError = structuredErrorText(d.optJSONObject("error"))
                             withContext(Dispatchers.Main) {
                                 liveClear()
-                                messages = withContext(Dispatchers.IO) { client().messages(sessionId) }
+                                val fresh = withContext(Dispatchers.IO) { client().recentMessages(sessionId) }
+                                messages = mergeHistory(messages, fresh)
                             }
                             break
                         }
@@ -738,15 +1156,16 @@ private fun App() {
                 stopStream()
                 withContext(Dispatchers.Main) {
                     liveClear()
-                    val loaded = withContext(Dispatchers.IO) { client().messages(sessionId) }
-                    messages = if (execError.isNotBlank() && loaded.none { m ->
+                    val loaded = withContext(Dispatchers.IO) { client().recentMessages(sessionId) }
+                    val merged = mergeHistory(messages, loaded)
+                    messages = if (execError.isNotBlank() && merged.none { m ->
                             m.blocks.any { it is ErrorBlock && it.text == execError }
                         }) {
-                        loaded + ChatMessage(
+                        merged + ChatMessage(
                             "err-" + sessionId, "assistant", listOf(ErrorBlock(execError)),
                             created = System.currentTimeMillis()
                         )
-                    } else loaded
+                    } else merged
                     busy = false
                 }
                 checkPending(sessionId)
@@ -803,6 +1222,8 @@ private fun App() {
                 run {
                     withContext(Dispatchers.IO) { client().compactSession(s.id) }
                     messages = withContext(Dispatchers.IO) { client().messages(s.id) }
+                    historyCursor = null
+                    historyHasMore = true
                 }
                 return true
             }
@@ -862,12 +1283,16 @@ private fun App() {
                             client().revertCommit(s.id)
                         }
                         messages = withContext(Dispatchers.IO) { client().messages(s.id) }
+                        historyCursor = null
+                        historyHasMore = true
                     }
                 }
             }
             SessionAction.COMPACT -> run {
                 withContext(Dispatchers.IO) { client().compactSession(s.id) }
                 messages = withContext(Dispatchers.IO) { client().messages(s.id) }
+                historyCursor = null
+                historyHasMore = true
             }
             SessionAction.FORK -> {
                 val last = messages.lastOrNull { !it.id.startsWith("local-") }
@@ -1071,7 +1496,8 @@ private fun App() {
         scope.launch {
             runCatching { withContext(Dispatchers.IO) { client().interrupt(s.id) } }
             withContext(Dispatchers.Main) {
-                messages = withContext(Dispatchers.IO) { client().messages(s.id) }
+                val fresh = withContext(Dispatchers.IO) { client().recentMessages(s.id) }
+                messages = mergeHistory(messages, fresh)
             }
         }
         stopStream()
@@ -1113,6 +1539,15 @@ private fun App() {
         val name = newName.trim()
         val parent = newParent.trim().ifBlank { "/" }
         if (name.isBlank()) return
+        val root = profiles.firstOrNull { it.id == activeProfileId }?.root?.trimEnd('/') ?: ""
+        if (root.isNotBlank()) {
+            val p = parent.trimEnd('/')
+            if (p != root && !p.startsWith("$root/")) {
+                newProjectError = "Проект должен быть внутри $root"
+                return
+            }
+        }
+        newProjectError = ""
         run {
             val path = withContext(Dispatchers.IO) { client().createProject(parent, name) }
             prefs.parentDir = parent
@@ -1129,6 +1564,7 @@ private fun App() {
 
     LaunchedEffect(Unit) {
         if (!prefs.isConfigured()) return@LaunchedEffect
+        launch { syncProfiles() }
         try {
             val connected = resolveConnection()
             if (!connected && status.isBlank()) status = "Сервер недоступен"
@@ -1156,6 +1592,9 @@ private fun App() {
                     if (sid.isNotBlank()) {
                         directory = prefs.directory
                         current = ChatSession(sid, prefs.lastSessionTitle.ifBlank { "Сессия" }, prefs.directory)
+                        historyCursor = null
+                        historyHasMore = true
+                        historyLoading = false
                         // Активность и последнюю историю запрашиваем параллельно.
                         val activeJob = async(Dispatchers.IO) {
                             runCatching { client().activeSessions().contains(sid) }.getOrDefault(false)
@@ -1174,7 +1613,7 @@ private fun App() {
                             // Не перетираем уже загруженный финальный результат,
                             // если наблюдение успело завершиться.
                             if (!active || watchJob.value?.isActive == true) {
-                                messages = loaded.getOrThrow()
+                                messages = mergeHistory(messages, loaded.getOrThrow())
                             }
                         } else if (loaded.exceptionOrNull()?.message?.contains("HTTP 404") == true) {
                             watchJob.value?.cancel()
@@ -1223,6 +1662,14 @@ private fun App() {
         val key = it.providerId + "/" + it.modelId
         key !in hiddenModels || (it.providerId == providerId && it.modelId == modelId)
     }
+    val visibleProjects = projects.filter { p ->
+        if (scopePath.isBlank()) true
+        else {
+            val s = scopePath.trimEnd('/')
+            p.worktree.trimEnd('/') == s || p.worktree.startsWith("$s/")
+        }
+    }
+    val activeProfile = profiles.firstOrNull { it.id == activeProfileId }
 
     val darkTheme = when (themeMode) {
         "light" -> false
@@ -1258,6 +1705,16 @@ private fun App() {
                     tailscaleUrl = tailscaleUrl, connectionMode = connectionMode,
                     speechUrl = speechUrl, activeBaseUrl = activeBaseUrl,
                     themeMode = themeMode, fontName = fontName, fontScale = fontScale,
+                    profiles = profiles, activeProfileId = activeProfileId,
+                    profileSyncError = profileSyncError,
+                    profileSyncing = profileSyncing,
+                    profileSummary = { p -> profileSummaryText(p) },
+                    onRefreshProfiles = { scope.launch { syncProfiles() } },
+                    onConfigureProfile = { configureProfile(it) },
+                    onActivateProfile = { switchProfile(it) },
+                    onAddProfile = { n, r -> addProfile(n, r) },
+                    onUpdateProfile = { updateProfile(it) },
+                    onDeleteProfile = { deleteProfile(it) },
                     onThemeMode = { themeMode = it; prefs.themeMode = it },
                     onFontName = { fontName = it; prefs.fontFamily = it },
                     onFontScale = { fontScale = it; prefs.fontScale = it },
@@ -1295,10 +1752,25 @@ private fun App() {
                 )
 
                 Screen.PROJECTS -> ProjectsScreen(
-                    projects = projects, busy = busy, status = status,
+                    projects = visibleProjects, busy = busy, status = status,
+                    profileName = activeProfile?.name ?: "Все проекты",
+                    profiles = profiles, activeProfileId = activeProfileId, scopePath = scopePath,
                     onOpen = { openProject(it) },
-                    onNew = { showNewProject = true },
+                    onNew = {
+                        newParent = (activeProfile?.root?.ifBlank { scopePath } ?: scopePath)
+                            .ifBlank { prefs.parentDir }
+                        newProjectError = ""
+                        showNewProject = true
+                    },
                     onReload = { loadProjects() },
+                    onSelectProfile = { switchProfile(it) },
+                    onOpenProfiles = { settingsFrom = Screen.PROJECTS; screen = Screen.SETTINGS },
+                    onScopeUp = { scopeUp() },
+                    onScopeRoot = { scopeToProfile() },
+                    // «Все проекты» — это не просто сброс области, а выход
+                    // из профиля: чип профиля должен смениться на «Все проекты».
+                    onAllProjects = { switchProfile("") },
+                    onUsage = { openProfileUsage() },
                     onSettings = { settingsFrom = Screen.PROJECTS; screen = Screen.SETTINGS }
                 )
 
@@ -1332,6 +1804,12 @@ private fun App() {
                     recording = recording, recordSeconds = recordSeconds, transcribing = transcribing,
                     onMic = { onMicTap() },
                     connectionKind = activeKind,
+                    profileName = activeProfile?.name ?: "Все проекты",
+                    sessionId = current?.id.orEmpty(),
+                    historyLoading = historyLoading,
+                    historyHasMore = historyHasMore,
+                    onLoadOlder = { loadOlderMessages() },
+                    onRevertMessage = { id -> revertToMessage(id) },
                     onInput = { v ->
                         input = v
                         if (v.endsWith("@") && !showMentionPicker) showMentionPicker = true
@@ -1360,9 +1838,10 @@ private fun App() {
 
     if (showNewProject) {
         NewProjectDialog(
-            parent = newParent, name = newName, busy = busy,
-            onParent = { newParent = it }, onName = { newName = it },
-            onDismiss = { if (!busy) showNewProject = false },
+            parent = newParent, name = newName, busy = busy, error = newProjectError,
+            onParent = { newParent = it; newProjectError = "" },
+            onName = { newName = it },
+            onDismiss = { if (!busy) { showNewProject = false; newProjectError = "" } },
             onCreate = { createProject() }
         )
     }
@@ -1500,9 +1979,28 @@ private fun App() {
     }
 
     if (showProjectUsage) {
+        val profileRoot = activeProfile?.root?.trimEnd('/') ?: ""
         ProjectUsageDialog(
             usage = projectUsage,
-            directory = directory,
+            directory = if (projectUsageIsProfile) profileRoot.ifBlank { "Все проекты" } else directory,
+            title = if (projectUsageIsProfile) "Использование профиля" else "Использование проекта",
+            subject = if (projectUsageIsProfile) "Профиль" else "Проект",
+            period = projectUsagePeriod,
+            customStart = projectUsageCustomStart,
+            customEnd = projectUsageCustomEnd,
+            loading = projectUsageLoading,
+            onPeriod = { period ->
+                projectUsagePeriod = period
+                loadProjectUsage()
+            },
+            onCustomStart = { ms ->
+                projectUsageCustomStart = ms
+                loadProjectUsage()
+            },
+            onCustomEnd = { ms ->
+                projectUsageCustomEnd = ms
+                loadProjectUsage()
+            },
             onDismiss = { showProjectUsage = false }
         )
     }
@@ -1536,6 +2034,15 @@ private fun SettingsScreen(
     baseUrl: String, user: String, password: String, busy: Boolean, status: String,
     tailscaleUrl: String, connectionMode: String, speechUrl: String, activeBaseUrl: String,
     themeMode: String, fontName: String, fontScale: Float,
+    profiles: List<Profile>, activeProfileId: String,
+    profileSyncError: String, profileSyncing: Boolean,
+    profileSummary: (Profile) -> String,
+    onRefreshProfiles: () -> Unit,
+    onConfigureProfile: (String) -> Unit,
+    onActivateProfile: (String) -> Unit,
+    onAddProfile: (String, String) -> Unit,
+    onUpdateProfile: (Profile) -> Unit,
+    onDeleteProfile: (String) -> Unit,
     onThemeMode: (String) -> Unit, onFontName: (String) -> Unit, onFontScale: (Float) -> Unit,
     onTailscaleUrl: (String) -> Unit, onConnectionMode: (String) -> Unit, onSpeechUrl: (String) -> Unit,
     onBack: (() -> Unit)?,
@@ -1543,6 +2050,9 @@ private fun SettingsScreen(
     onSave: () -> Unit
 ) {
     var showPassword by remember { mutableStateOf(false) }
+    var showProfileDialog by remember { mutableStateOf(false) }
+    var editingProfile by remember { mutableStateOf<Profile?>(null) }
+    var confirmDeleteProfile by remember { mutableStateOf<Profile?>(null) }
     Scaffold(topBar = {
         TopAppBar(
             title = { Text("Настройки") },
@@ -1648,6 +2158,87 @@ private fun SettingsScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(20.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Профили", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                Spacer(Modifier.weight(1f))
+                TextButton(
+                    onClick = onRefreshProfiles,
+                    enabled = !profileSyncing
+                ) { Text(if (profileSyncing) "Обновление…" else "Обновить") }
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Имя и папка общие с веб-интерфейсом. Модель, агент и вариант — локальные; «Настроить» открывает чат с нужными настройками. Логин общий.",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (profileSyncError.isNotBlank()) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Синхронизация: $profileSyncError",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.error,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            if (profiles.isEmpty()) {
+                Text(
+                    "Профилей пока нет. Добавьте, например, «Алиса» и «Боб» и укажите каждому свою папку.",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            profiles.forEach { p ->
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clickable { onActivateProfile(p.id) }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(
+                        selected = p.id == activeProfileId,
+                        onClick = { onActivateProfile(p.id) }
+                    )
+                    Column(Modifier.weight(1f)) {
+                        Text(p.name, fontWeight = FontWeight.Medium)
+                        Text(
+                            p.root.ifBlank { "все проекты" },
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            profileSummary(p),
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        TextButton(
+                            onClick = { onConfigureProfile(p.id) },
+                            contentPadding = PaddingValues(0.dp),
+                            modifier = Modifier.heightIn(min = 0.dp)
+                        ) {
+                            Text("Настроить", fontSize = 12.sp)
+                        }
+                    }
+                    IconButton(onClick = { editingProfile = p; showProfileDialog = true }) {
+                        Icon(Icons.Filled.Edit, contentDescription = "Изменить профиль")
+                    }
+                    IconButton(onClick = { confirmDeleteProfile = p }) {
+                        Icon(Icons.Filled.Delete, contentDescription = "Удалить профиль")
+                    }
+                }
+            }
+            TextButton(
+                onClick = { editingProfile = null; showProfileDialog = true },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("+ Добавить профиль") }
+            Spacer(Modifier.height(20.dp))
             Text("Сервер", fontWeight = FontWeight.Bold, fontSize = 18.sp)
             Spacer(Modifier.height(8.dp))
             Text("Логин", fontWeight = FontWeight.Bold)
@@ -1680,14 +2271,99 @@ private fun SettingsScreen(
             Spacer(Modifier.height(20.dp))
         }
     }
+
+    if (showProfileDialog) {
+        ProfileEditDialog(
+            initial = editingProfile,
+            onDismiss = { showProfileDialog = false },
+            onSave = { name, root ->
+                val e = editingProfile
+                if (e == null) onAddProfile(name, root)
+                else onUpdateProfile(e.copy(name = name, root = root))
+                showProfileDialog = false
+            }
+        )
+    }
+
+    confirmDeleteProfile?.let { p ->
+        AlertDialog(
+            onDismissRequest = { confirmDeleteProfile = null },
+            title = { Text("Удалить профиль?") },
+            text = { Text("Профиль «${p.name}» будет удалён. Проекты и сессии на сервере останутся.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    onDeleteProfile(p.id)
+                    confirmDeleteProfile = null
+                }) { Text("Удалить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDeleteProfile = null }) { Text("Отмена") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun ProfileEditDialog(
+    initial: Profile?,
+    onDismiss: () -> Unit,
+    onSave: (String, String) -> Unit
+) {
+    var name by remember(initial?.id) { mutableStateOf(initial?.name ?: "") }
+    var root by remember(initial?.id) { mutableStateOf(initial?.root ?: "") }
+    val rootValid = root.isBlank() || root.trim().startsWith("/")
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (initial == null) "Новый профиль" else "Профиль") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("Имя") }
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = root,
+                    onValueChange = { root = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("Папка проектов") },
+                    placeholder = { Text("/home/gmpony/work/alice") },
+                    isError = !rootValid
+                )
+                Text(
+                    if (!rootValid) "Нужен абсолютный путь, например /home/gmpony/work/alice"
+                    else "Папка создастся при первом проекте. Пусто — все проекты.",
+                    fontSize = 11.sp,
+                    color = if (!rootValid) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onSave(name.trim(), root.trim()) },
+                enabled = name.isNotBlank() && rootValid
+            ) { Text("Сохранить") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ProjectsScreen(
     projects: List<Project>, busy: Boolean, status: String,
-    onOpen: (Project) -> Unit, onNew: () -> Unit, onReload: () -> Unit, onSettings: () -> Unit
+    profileName: String, profiles: List<Profile>, activeProfileId: String, scopePath: String,
+    onOpen: (Project) -> Unit, onNew: () -> Unit, onReload: () -> Unit, onSettings: () -> Unit,
+    onSelectProfile: (String) -> Unit, onOpenProfiles: () -> Unit,
+    onScopeUp: () -> Unit, onScopeRoot: () -> Unit, onAllProjects: () -> Unit,
+    onUsage: () -> Unit
 ) {
+    var profileMenu by remember { mutableStateOf(false) }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -1697,6 +2373,129 @@ private fun ProjectsScreen(
         }
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(Modifier.weight(1f)) {
+                    AssistChip(
+                        onClick = { profileMenu = true },
+                        label = {
+                            Text(
+                                profileName,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        },
+                        leadingIcon = {
+                            Icon(
+                                Icons.Filled.Person,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        },
+                        trailingIcon = {
+                            Icon(Icons.Filled.ExpandMore, contentDescription = null)
+                        }
+                    )
+                    DropdownMenu(expanded = profileMenu, onDismissRequest = { profileMenu = false }) {
+                        profiles.forEach { p ->
+                            DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        if (p.id == activeProfileId) {
+                                            Icon(
+                                                Icons.Filled.Check,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(Modifier.size(6.dp))
+                                        }
+                                        Column {
+                                            Text(p.name)
+                                            if (p.root.isNotBlank()) {
+                                                Text(
+                                                    p.root,
+                                                    fontSize = 10.sp,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        }
+                                    }
+                                },
+                                onClick = {
+                                    profileMenu = false
+                                    onSelectProfile(p.id)
+                                }
+                            )
+                        }
+                        if (profiles.isEmpty()) {
+                            DropdownMenuItem(
+                                text = { Text("Профили не настроены") },
+                                onClick = {
+                                    profileMenu = false
+                                    onOpenProfiles()
+                                }
+                            )
+                        }
+                        DropdownMenuItem(
+                            text = {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (activeProfileId.isBlank()) {
+                                        Icon(
+                                            Icons.Filled.Check,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(Modifier.size(6.dp))
+                                    }
+                                    Text("Все проекты")
+                                }
+                            },
+                            onClick = {
+                                profileMenu = false
+                                onAllProjects()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Использование профиля") },
+                            onClick = {
+                                profileMenu = false
+                                onUsage()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Настроить профили") },
+                            onClick = {
+                                profileMenu = false
+                                onOpenProfiles()
+                            }
+                        )
+                    }
+                }
+                if (activeProfileId.isNotBlank()) {
+                    if (scopePath.isNotBlank()) {
+                        IconButton(
+                            onClick = onScopeUp,
+                            enabled = scopePath.trimEnd('/').isNotBlank()
+                        ) {
+                            Icon(Icons.Filled.ArrowUpward, contentDescription = "На уровень выше")
+                        }
+                    }
+                    TextButton(onClick = onScopeRoot) { Text("Профиль") }
+                }
+                IconButton(onClick = onUsage) {
+                    Icon(Icons.Filled.BarChart, contentDescription = "Использование профиля")
+                }
+            }
+            Text(
+                if (scopePath.isBlank()) "Все проекты" else scopePath,
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 16.dp)
+            )
             Button(onClick = onNew, enabled = !busy, modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                 Text("+ Новый проект")
             }
@@ -2334,6 +3133,12 @@ private fun ChatScreen(
     recording: Boolean, recordSeconds: Int, transcribing: Boolean,
     onMic: () -> Unit,
     connectionKind: String,
+    profileName: String,
+    sessionId: String,
+    historyLoading: Boolean,
+    historyHasMore: Boolean,
+    onLoadOlder: () -> Unit,
+    onRevertMessage: (String) -> Unit,
     onOpenFiles: () -> Unit,
     onBack: () -> Unit, onSettings: () -> Unit
 ) {
@@ -2362,9 +3167,100 @@ private fun ChatScreen(
     val attachLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) onAttach(uri)
     }
+    val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) onAttach(uri)
+    }
+
+    var pendingCameraUri by rememberSaveable { mutableStateOf<String?>(null) }
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        if (ok) {
+            pendingCameraUri?.let { value -> onAttach(Uri.parse(value)) }
+        }
+        pendingCameraUri = null
+    }
+
+    fun openCamera() {
+        val dir = runCatching {
+            File(context.cacheDir, "camera").apply { if (!exists()) mkdirs() }
+        }.getOrNull()
+        val file = runCatching {
+            File.createTempFile("photo_", ".jpg", dir)
+        }.getOrNull()
+        if (file == null) {
+            Toast.makeText(context, "Не удалось создать файл для фото", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = runCatching {
+            FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
+        }.getOrNull()
+        if (uri == null) {
+            Toast.makeText(context, "Не удалось подготовить камеру", Toast.LENGTH_SHORT).show()
+            return
+        }
+        pendingCameraUri = uri.toString()
+        runCatching { cameraLauncher.launch(uri) }.onFailure {
+            pendingCameraUri = null
+            Toast.makeText(context, "Камера недоступна", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     val listState = rememberLazyListState()
     val listScope = rememberCoroutineScope()
+    var historyArmed by remember(sessionId) { mutableStateOf(false) }
+    var pendingAnchor by remember(sessionId) { mutableStateOf<Pair<String, Int>?>(null) }
+    var revertTarget by remember(sessionId) { mutableStateOf<ChatMessage?>(null) }
+
+    fun messageTime(ms: Long): String =
+        if (ms > 0) DateFormat.getTimeFormat(context).format(Date(ms)) else ""
+
+    fun formatDuration(ms: Long): String {
+        val total = (ms / 1000).coerceAtLeast(0)
+        return if (total < 60) "$total с" else "${total / 60} мин ${total % 60} с"
+    }
+
+    /** Время всего хода (от вопроса до последнего ответа) — как в веб-интерфейсе. */
+    fun turnDurationMs(message: ChatMessage): Long {
+        if (message.role != "assistant") return 0
+        val idx = messages.indexOfFirst { it.id == message.id }
+        if (idx < 0) return 0
+        var nextUser = messages.size
+        for (j in idx + 1 until messages.size) {
+            if (messages[j].role == "user") {
+                nextUser = j
+                break
+            }
+        }
+        var lastAssistant = -1
+        for (j in nextUser - 1 downTo idx) {
+            if (messages[j].role == "assistant") {
+                lastAssistant = j
+                break
+            }
+        }
+        if (lastAssistant != idx) return 0
+        var userIdx = -1
+        for (j in idx downTo 0) {
+            if (messages[j].role == "user") {
+                userIdx = j
+                break
+            }
+        }
+        if (userIdx < 0) return 0
+        val start = messages[userIdx].created
+        val end = message.completed
+        if (start <= 0 || end <= 0 || end < start) return 0
+        return end - start
+    }
+
+    fun requestOlder() {
+        if (historyLoading || !historyHasMore) return
+        val first = listState.firstVisibleItemIndex
+        val offset = listState.firstVisibleItemScrollOffset
+        val anchorId = messages.getOrNull(first)?.id
+        if (anchorId != null) pendingAnchor = anchorId to offset
+        onLoadOlder()
+    }
+
     val scrollToBottom: () -> Unit = {
         listScope.launch {
             val last = listState.layoutInfo.totalItemsCount - 1
@@ -2377,9 +3273,76 @@ private fun ChatScreen(
             info.totalItemsCount == 0 || info.visibleItemsInfo.lastOrNull()?.index == info.totalItemsCount - 1
         }
     }
-    LaunchedEffect(messages.size, liveBlocks.size, busy) {
+    var stickToBottom by remember(sessionId) { mutableStateOf(true) }
+    var stickReady by remember(sessionId) { mutableStateOf(false) }
+    LaunchedEffect(listState, sessionId) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            info.totalItemsCount == 0 ||
+                info.visibleItemsInfo.lastOrNull()?.index == info.totalItemsCount - 1
+        }.collect { atEnd ->
+            if (stickReady) stickToBottom = atEnd
+        }
+    }
+    // Открыли сессию / появилась история — сразу в конец.
+    LaunchedEffect(sessionId, messages.isNotEmpty()) {
+        if (messages.isEmpty() || historyLoading || pendingAnchor != null) return@LaunchedEffect
+        val target = if (busy) messages.size + 1 else messages.size
+        listState.scrollToItem(target)
+        stickToBottom = true
+        stickReady = true
+    }
+    // Ответ готов (busy true -> false) — тоже в конец.
+    LaunchedEffect(busy) {
+        if (busy || messages.isEmpty() || historyLoading || pendingAnchor != null) return@LaunchedEffect
+        listState.scrollToItem(messages.size)
+        stickToBottom = true
+        stickReady = true
+    }
+    LaunchedEffect(messages.size, liveBlocks.size, busy, historyLoading) {
+        // При подгрузке старых сообщений не прыгаем вниз: позицию
+        // восстанавливает pendingAnchor. Если пользователь читает историю
+        // вверху — новые токены тоже не должны утаскивать его вниз.
+        if (historyLoading || pendingAnchor != null || !stickReady || !stickToBottom) return@LaunchedEffect
         val target = if (busy) messages.size + 1 else messages.size
         if (target >= 0) listState.scrollToItem(target)
+    }
+    LaunchedEffect(messages.size, historyLoading) {
+        val anchor = pendingAnchor ?: return@LaunchedEffect
+        if (historyLoading) return@LaunchedEffect
+        val index = messages.indexOfFirst { it.id == anchor.first }
+        if (index >= 0) listState.scrollToItem(index, anchor.second)
+        pendingAnchor = null
+    }
+    LaunchedEffect(listState, sessionId, messages.size, historyLoading, historyHasMore) {
+        snapshotFlow {
+            listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+        }.collect { (index, offset) ->
+            if (index > 1) historyArmed = true
+            if (historyArmed && index == 0 && offset <= 8 &&
+                messages.isNotEmpty() && !historyLoading &&
+                historyHasMore && pendingAnchor == null
+            ) {
+                requestOlder()
+            }
+        }
+    }
+
+    revertTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { revertTarget = null },
+            title = { Text("Откатить до этого вопроса?") },
+            text = { Text("Этот вопрос и все сообщения после него будут убраны из сессии.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    revertTarget = null
+                    onRevertMessage(target.id)
+                }) { Text("Откатить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { revertTarget = null }) { Text("Отмена") }
+            }
+        )
     }
 
     Scaffold(
@@ -2406,8 +3369,27 @@ private fun ChatScreen(
                     Modifier.fillMaxWidth().padding(end = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    ConnectionBadge(connectionKind)
-                    Spacer(Modifier.weight(1f))
+                    Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                        ConnectionBadge(connectionKind)
+                        if (profileName.isNotBlank()) {
+                            Spacer(Modifier.size(6.dp))
+                            Icon(
+                                Icons.Filled.Person,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.size(2.dp))
+                            Text(
+                                profileName,
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                        }
+                    }
                     Box {
                         TextButton(onClick = { variantMenu = true }) {
                             Text(variantLabel, fontSize = 13.sp)
@@ -2456,6 +3438,16 @@ private fun ChatScreen(
                 contentPadding = PaddingValues(12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                if (historyLoading) {
+                    item(key = "history-loading") {
+                        Box(
+                            Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                        }
+                    }
+                }
                 items(messages, key = { it.id }) { m ->
                     val isUser = m.role == "user"
                     val attachmentsBlock: @Composable () -> Unit = {
@@ -2468,20 +3460,67 @@ private fun ChatScreen(
                         }
                     }
                     if (isUser) {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                            Box(
-                                Modifier
-                                    .fillMaxWidth(0.82f)
-                                    .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(18.dp))
-                                    .padding(12.dp)
-                            ) {
-                                Column {
-                                    SelectionContainer {
-                                        Column {
-                                            m.blocks.forEach { block -> BlockView(block, MaterialTheme.colorScheme.primary) }
+                        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth(0.82f)
+                                        .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(18.dp))
+                                        .padding(12.dp)
+                                ) {
+                                    Column {
+                                        SelectionContainer {
+                                            Column {
+                                                m.blocks.forEach { block -> BlockView(block, MaterialTheme.colorScheme.primary) }
+                                            }
                                         }
+                                        attachmentsBlock()
                                     }
-                                    attachmentsBlock()
+                                }
+                            }
+                            Row(
+                                Modifier.padding(top = 2.dp, end = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                val time = messageTime(m.created)
+                                if (time.isNotBlank()) {
+                                    Text(
+                                        time,
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                if (!m.id.startsWith("local-")) {
+                                    IconButton(
+                                        onClick = { revertTarget = m },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.AutoMirrored.Filled.Undo,
+                                            contentDescription = "Откатить до этого вопроса",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                    }
+                                }
+                                val copyText = m.blocks.filterIsInstance<TextBlock>()
+                                    .joinToString("\n\n") { it.text }.trim()
+                                if (copyText.isNotBlank()) {
+                                    IconButton(
+                                        onClick = {
+                                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                            cm.setPrimaryClip(ClipData.newPlainText("opencode", copyText))
+                                            Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+                                        },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.ContentCopy,
+                                            contentDescription = "Копировать",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -2494,19 +3533,30 @@ private fun ChatScreen(
                                 }
                             }
                             val copyText = m.blocks.filterIsInstance<TextBlock>().joinToString("\n\n") { it.text }
-                            if (copyText.isNotBlank()) {
-                                IconButton(
-                                    onClick = {
-                                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                        cm.setPrimaryClip(ClipData.newPlainText("opencode", copyText))
-                                    },
-                                    modifier = Modifier.size(30.dp)
-                                ) {
-                                    Icon(
-                                        Icons.Filled.ContentCopy,
-                                        contentDescription = "Копировать",
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(16.dp)
+                            val durationMs = turnDurationMs(m)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (copyText.isNotBlank()) {
+                                    IconButton(
+                                        onClick = {
+                                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                            cm.setPrimaryClip(ClipData.newPlainText("opencode", copyText))
+                                        },
+                                        modifier = Modifier.size(30.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.ContentCopy,
+                                            contentDescription = "Копировать",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+                                if (durationMs > 0) {
+                                    Text(
+                                        formatDuration(durationMs),
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(start = 4.dp, end = 4.dp)
                                     )
                                 }
                             }
@@ -2740,7 +3790,36 @@ private fun ChatScreen(
                         }
                         DropdownMenu(expanded = addMenu, onDismissRequest = { addMenu = false }) {
                             DropdownMenuItem(
-                                text = { Text("Прикрепить к сообщению") },
+                                text = { Text("Камера") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.PhotoCamera, contentDescription = null)
+                                },
+                                onClick = {
+                                    addMenu = false
+                                    openCamera()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Галерея") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.PhotoLibrary, contentDescription = null)
+                                },
+                                onClick = {
+                                    addMenu = false
+                                    runCatching {
+                                        galleryLauncher.launch(
+                                            PickVisualMediaRequest(
+                                                ActivityResultContracts.PickVisualMedia.ImageOnly
+                                            )
+                                        )
+                                    }
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Прикрепить файл") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.UploadFile, contentDescription = null)
+                                },
                                 onClick = {
                                     addMenu = false
                                     runCatching { attachLauncher.launch("*/*") }
@@ -2748,6 +3827,9 @@ private fun ChatScreen(
                             )
                             DropdownMenuItem(
                                 text = { Text("Файлы проекта") },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.Folder, contentDescription = null)
+                                },
                                 onClick = { addMenu = false; onOpenFiles() }
                             )
                         }
@@ -3410,19 +4492,104 @@ private fun UsageDialog(
     )
 }
 
+private fun usagePeriodLabel(period: UsagePeriod, customStart: Long, customEnd: Long): String =
+    when (period) {
+        UsagePeriod.DAY -> "Сегодня"
+        UsagePeriod.MONTH -> "Текущий месяц"
+        UsagePeriod.ALL -> "Всё время"
+        UsagePeriod.CUSTOM -> fmtDay(customStart) + " — " + fmtDay(customEnd)
+    }
+
+@Composable
+private fun UsagePeriodChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = { Text(label) }
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ProjectUsageDialog(
-    usage: ProjectUsage?, directory: String, onDismiss: () -> Unit
+    usage: ProjectUsage?, directory: String,
+    title: String = "Использование проекта", subject: String = "Проект",
+    period: UsagePeriod,
+    customStart: Long, customEnd: Long,
+    loading: Boolean,
+    onPeriod: (UsagePeriod) -> Unit,
+    onCustomStart: (Long) -> Unit,
+    onCustomEnd: (Long) -> Unit,
+    onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
+    fun pickDate(initial: Long, onPick: (Long) -> Unit) {
+        val c = Calendar.getInstance()
+        c.timeInMillis = initial
+        DatePickerDialog(
+            context,
+            { _, year, month, day ->
+                val picked = Calendar.getInstance()
+                picked.set(year, month, day, 0, 0, 0)
+                picked.set(Calendar.MILLISECOND, 0)
+                onPick(picked.timeInMillis)
+            },
+            c.get(Calendar.YEAR),
+            c.get(Calendar.MONTH),
+            c.get(Calendar.DAY_OF_MONTH)
+        ).show()
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Использование проекта") },
+        title = { Text(title) },
         text = {
             Column(Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState())) {
+                Text("Период", fontWeight = FontWeight.Bold)
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    UsagePeriodChip("День", period == UsagePeriod.DAY) { onPeriod(UsagePeriod.DAY) }
+                    UsagePeriodChip("Месяц", period == UsagePeriod.MONTH) { onPeriod(UsagePeriod.MONTH) }
+                    UsagePeriodChip("Всё время", period == UsagePeriod.ALL) { onPeriod(UsagePeriod.ALL) }
+                    UsagePeriodChip("Период", period == UsagePeriod.CUSTOM) { onPeriod(UsagePeriod.CUSTOM) }
+                }
+                if (period == UsagePeriod.CUSTOM) {
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { pickDate(customStart, onCustomStart) },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("С: " + fmtDay(customStart), fontSize = 12.sp, maxLines = 1)
+                        }
+                        OutlinedButton(
+                            onClick = { pickDate(customEnd, onCustomEnd) },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("По: " + fmtDay(customEnd), fontSize = 12.sp, maxLines = 1)
+                        }
+                    }
+                }
+                Text(
+                    "Для дня/месяца/периода — по датам сообщений (ответов модели)",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (loading) {
+                    Spacer(Modifier.height(6.dp))
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+                Spacer(Modifier.height(10.dp))
                 val u = usage
                 if (u == null) {
-                    Text("Нет данных")
+                    Text(if (loading) "Загрузка…" else "Нет данных")
                 } else {
+                    UsageRow("Период", usagePeriodLabel(period, customStart, customEnd))
                     UsageRow("Стоимость", "$" + String.format(java.util.Locale.US, "%.4f", u.cost))
                     UsageRow("Сессий", fmtNum(u.sessions.toLong()))
                     Spacer(Modifier.height(10.dp))
@@ -3433,7 +4600,7 @@ private fun ProjectUsageDialog(
                     UsageRow("Кэш (чтение)", fmtNum(u.cacheRead))
                     UsageRow("Кэш (запись)", fmtNum(u.cacheWrite))
                     Spacer(Modifier.height(10.dp))
-                    Text("Проект", fontWeight = FontWeight.Bold)
+                    Text(subject, fontWeight = FontWeight.Bold)
                     UsageRow("Каталог", directory)
                     if (u.created > 0) UsageRow("Первый сеанс", fmtDate(u.created))
                     if (u.updated > 0) UsageRow("Последний", fmtDate(u.updated))
@@ -3489,7 +4656,7 @@ private fun fmtDate(ms: Long): String =
 
 @Composable
 private fun NewProjectDialog(
-    parent: String, name: String, busy: Boolean,
+    parent: String, name: String, busy: Boolean, error: String = "",
     onParent: (String) -> Unit, onName: (String) -> Unit,
     onDismiss: () -> Unit, onCreate: () -> Unit
 ) {
@@ -3508,6 +4675,10 @@ private fun NewProjectDialog(
                     "Будет создана папка <папка>/<название> и git-репозиторий.",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                if (error.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(error, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                }
             }
         },
         confirmButton = {

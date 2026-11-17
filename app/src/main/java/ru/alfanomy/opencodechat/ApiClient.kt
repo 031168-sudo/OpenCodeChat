@@ -24,7 +24,8 @@ data class ChatMessage(
     val role: String,
     val blocks: List<Block>,
     val attachments: List<Attachment> = emptyList(),
-    val created: Long = 0L
+    val created: Long = 0L,
+    val completed: Long = 0L
 )
 
 data class Project(val id: String, val name: String, val worktree: String)
@@ -204,6 +205,56 @@ class ApiClient(
             out.add(Project(o.optString("id"), name, canonical))
         }
         return out
+    }
+
+    /**
+     * Профили веб-интерфейса (~/caddy/oc-profiles.json) — общий список
+     * для веба и приложения. Запросы идут на публичный адрес прокси,
+     * потому что /profiles/api есть только там.
+     */
+    fun listProfiles(): List<Profile> {
+        val o = JSONObject(request("/profiles/api", "GET"))
+        val arr = o.optJSONArray("profiles") ?: return emptyList()
+        val out = ArrayList<Profile>()
+        for (i in 0 until arr.length()) {
+            val p = arr.getJSONObject(i)
+            val id = p.optString("id")
+            val name = p.optString("name")
+            if (id.isBlank() || name.isBlank()) continue
+            out.add(Profile(id, name, p.optString("root")))
+        }
+        return out
+    }
+
+    fun saveProfile(name: String, root: String, id: String? = null): Profile {
+        val profile = JSONObject()
+            .put("name", name.trim())
+            .put("root", root.trim())
+        if (!id.isNullOrBlank()) profile.put("id", id)
+        val body = JSONObject()
+            .put("action", "save")
+            .put("profile", profile)
+            // Не затирать модель, если она задана в вебе.
+            .put("keepModel", true)
+        val o = JSONObject(request("/profiles/api", "POST", body))
+        val newId = o.optString("id")
+        val arr = o.optJSONArray("profiles")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val p = arr.getJSONObject(i)
+                if (p.optString("id") == newId) {
+                    return Profile(newId, p.optString("name"), p.optString("root"))
+                }
+            }
+        }
+        return Profile(newId, name.trim(), root.trim().trimEnd('/'))
+    }
+
+    fun deleteProfile(id: String) {
+        request(
+            "/profiles/api", "POST",
+            JSONObject().put("action", "delete").put("id", id)
+        )
     }
 
     fun listSessionDirectories(): List<String> {
@@ -417,11 +468,23 @@ class ApiClient(
 
     fun messages(sessionId: String): List<ChatMessage> {
         // Длинные сессии содержат огромные вложения/вывод инструментов.
-        // Берём только последний вопрос и последние ответы — это быстро
-        // и не приводит к OOM на телефоне.
+        // Для первого открытия берём последние 20 вопросов и 20 ответов:
+        // так вопросы не пропадают, но старые tool-выводы не тянутся.
+        return fetchMessages(sessionId, userLimit = 20)
+    }
+
+    /**
+     * Лёгкое обновление после шага/возврата в приложение: последний вопрос и
+     * последние ответы. Вопросы и подгруженная история сохраняются на клиенте
+     * (mergeHistory), поэтому повторно тянуть их с сервера не нужно.
+     */
+    fun recentMessages(sessionId: String): List<ChatMessage> =
+        fetchMessages(sessionId, userLimit = 1)
+
+    private fun fetchMessages(sessionId: String, userLimit: Int): List<ChatMessage> {
         val out = ArrayList<ChatMessage>()
         val user = JSONObject(
-            request("/api/session/$sessionId/message?limit=1&order=desc&type=user", "GET")
+            request("/api/session/$sessionId/message?limit=$userLimit&order=desc&type=user", "GET")
         )
         user.optJSONArray("data")?.let { parseMessagesInto(it, out) }
         val assistant = JSONObject(
@@ -431,11 +494,36 @@ class ApiClient(
         return out.sortedBy { it.created }.distinctBy { it.id }
     }
 
+    /**
+     * Одна страница истории для подгрузки вверх. cursor = null — свежая
+     * страница (order = desc), иначе следующая более старая по cursor.next.
+     */
+    fun messagePage(
+        sessionId: String,
+        cursor: String? = null,
+        limit: Int = 40
+    ): Pair<List<ChatMessage>, String?> {
+        var path = "/api/session/$sessionId/message?limit=$limit"
+        if (cursor.isNullOrBlank()) {
+            path += "&order=desc"
+        } else {
+            path += "&cursor=" + URLEncoder.encode(cursor, "UTF-8")
+        }
+        val o = JSONObject(request(path, "GET"))
+        val arr = o.optJSONArray("data") ?: return emptyList<ChatMessage>() to null
+        val out = ArrayList<ChatMessage>()
+        parseMessagesInto(arr, out)
+        val next = o.optJSONObject("cursor")?.optString("next")
+            ?.let { if (it.isBlank() || it == "null") null else it }
+        return out to next
+    }
+
     private fun parseMessagesInto(arr: JSONArray, out: MutableList<ChatMessage>) {
         for (i in 0 until arr.length()) {
             val m = arr.getJSONObject(i)
             val id = m.optString("id")
             val created = m.optJSONObject("time")?.optLong("created") ?: 0L
+            val completed = m.optJSONObject("time")?.optLong("completed") ?: 0L
             when (m.optString("type")) {
                 "user" -> {
                     val files = ArrayList<Attachment>()
@@ -482,7 +570,7 @@ class ApiClient(
                     } else if (m.optString("finish") == "content-filter") {
                         blocks.add(ErrorBlock("Ответ заблокирован фильтром провайдера"))
                     }
-                    if (blocks.isNotEmpty()) out.add(ChatMessage(id, "assistant", blocks, emptyList(), created))
+                    if (blocks.isNotEmpty()) out.add(ChatMessage(id, "assistant", blocks, emptyList(), created, completed))
                 }
             }
         }
@@ -671,7 +759,27 @@ class ApiClient(
      * Суммарное использование по всем сессиям каталога (проекта):
      * стоимость и токены. Проходит все страницы списка сессий.
      */
-    fun projectUsage(directory: String): ProjectUsage {
+    fun projectUsage(
+        directory: String,
+        recursive: Boolean = false,
+        fromMillis: Long? = null,
+        toMillis: Long? = null
+    ): ProjectUsage {
+        return if (fromMillis == null && toMillis == null) {
+            projectUsageAll(directory, recursive)
+        } else {
+            // Для периода считаем по сообщениям: сессия может быть создана
+            // раньше, а токены/стоимость тратиться сегодня.
+            projectUsageMessages(
+                directory, recursive,
+                fromMillis ?: Long.MIN_VALUE,
+                toMillis ?: Long.MAX_VALUE
+            )
+        }
+    }
+
+    private fun projectUsageAll(directory: String, recursive: Boolean): ProjectUsage {
+        val root = directory.trimEnd('/')
         var cursor: String? = null
         var pages = 0
         var sessions = 0
@@ -686,10 +794,15 @@ class ApiClient(
         while (pages < 50) {
             var path = "/api/session?limit=200&order=desc"
             if (!cursor.isNullOrBlank()) path += "&cursor=" + URLEncoder.encode(cursor, "UTF-8")
-            val o = JSONObject(request(path, "GET", directory = directory))
+            val o = JSONObject(request(path, "GET", directory = if (recursive) null else directory))
             val arr = o.optJSONArray("data") ?: break
             for (i in 0 until arr.length()) {
                 val s = arr.getJSONObject(i)
+                if (recursive) {
+                    val d = s.optJSONObject("location")?.optString("directory").orEmpty().trimEnd('/')
+                    val match = root.isBlank() || d == root || d.startsWith("$root/")
+                    if (!match) continue
+                }
                 sessions++
                 cost += s.optDouble("cost", 0.0)
                 val t = s.optJSONObject("tokens") ?: JSONObject()
@@ -709,6 +822,113 @@ class ApiClient(
                 ?.let { if (it.isBlank() || it == "null") null else it }
             pages++
             if (arr.length() == 0 || cursor.isNullOrBlank()) break
+        }
+        return ProjectUsage(
+            sessions = sessions,
+            cost = cost,
+            input = input,
+            output = output,
+            reasoning = reasoning,
+            cacheRead = cacheRead,
+            cacheWrite = cacheWrite,
+            created = if (created == Long.MAX_VALUE) 0L else created,
+            updated = updated
+        )
+    }
+
+    private fun projectUsageMessages(
+        directory: String,
+        recursive: Boolean,
+        fromMillis: Long,
+        toMillis: Long
+    ): ProjectUsage {
+        val root = directory.trimEnd('/')
+        var cursor: String? = null
+        var pages = 0
+        var sessions = 0
+        var cost = 0.0
+        var input = 0L
+        var output = 0L
+        var reasoning = 0L
+        var cacheRead = 0L
+        var cacheWrite = 0L
+        var created = Long.MAX_VALUE
+        var updated = 0L
+
+        while (pages < 50) {
+            var path = "/api/session?limit=200&order=desc"
+            if (!cursor.isNullOrBlank()) path += "&cursor=" + URLEncoder.encode(cursor, "UTF-8")
+            val o = JSONObject(request(path, "GET", directory = if (recursive) null else directory))
+            val arr = o.optJSONArray("data") ?: break
+            var pageLatest = 0L
+            for (i in 0 until arr.length()) {
+                val s = arr.getJSONObject(i)
+                if (recursive) {
+                    val d = s.optJSONObject("location")?.optString("directory").orEmpty().trimEnd('/')
+                    val match = root.isBlank() || d == root || d.startsWith("$root/")
+                    if (!match) continue
+                }
+                val time = s.optJSONObject("time")
+                val cr = time?.optLong("created") ?: 0L
+                val up = time?.optLong("updated") ?: 0L
+                if (up > pageLatest) pageLatest = up
+                if (up > 0 && up < fromMillis) continue
+                if (cr > 0 && cr > toMillis) continue
+                val sessionId = s.optString("id")
+                if (sessionId.isBlank()) continue
+
+                var counted = false
+                var msgCursor: String? = null
+                var msgPages = 0
+                var stop = false
+                while (msgPages < 50 && !stop) {
+                    var msgPath = "/api/session/$sessionId/message?limit=200&type=assistant"
+                    if (msgCursor.isNullOrBlank()) {
+                        msgPath += "&order=desc"
+                    } else {
+                        msgPath += "&cursor=" + URLEncoder.encode(msgCursor, "UTF-8")
+                    }
+                    val mo = runCatching { JSONObject(request(msgPath, "GET")) }.getOrNull() ?: break
+                    val msgs = mo.optJSONArray("data") ?: break
+                    for (j in 0 until msgs.length()) {
+                        val m = msgs.getJSONObject(j)
+                        val mt = m.optJSONObject("time")?.optLong("created") ?: 0L
+                        if (mt > 0 && mt > toMillis) continue
+                        if (mt > 0 && mt < fromMillis) {
+                            stop = true
+                            break
+                        }
+                        val tokens = m.optJSONObject("tokens")
+                        val msgCost = m.optDouble("cost", 0.0)
+                        if (tokens == null && msgCost <= 0.0) continue
+                        if (!counted) {
+                            sessions++
+                            counted = true
+                        }
+                        cost += msgCost
+                        if (tokens != null) {
+                            input += tokens.optLong("input")
+                            output += tokens.optLong("output")
+                            reasoning += tokens.optLong("reasoning")
+                            val cache = tokens.optJSONObject("cache")
+                            cacheRead += cache?.optLong("read") ?: 0L
+                            cacheWrite += cache?.optLong("write") ?: 0L
+                        }
+                        if (mt > 0 && mt < created) created = mt
+                        if (mt > updated) updated = mt
+                    }
+                    if (stop) break
+                    msgCursor = mo.optJSONObject("cursor")?.optString("next")
+                        ?.let { if (it.isBlank() || it == "null") null else it }
+                    msgPages++
+                    if (msgs.length() == 0 || msgCursor.isNullOrBlank()) break
+                }
+            }
+            cursor = o.optJSONObject("cursor")?.optString("next")
+                ?.let { if (it.isBlank() || it == "null") null else it }
+            pages++
+            if (arr.length() == 0 || cursor.isNullOrBlank()) break
+            if (pageLatest > 0 && pageLatest < fromMillis) break
         }
         return ProjectUsage(
             sessions = sessions,

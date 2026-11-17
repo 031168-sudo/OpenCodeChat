@@ -26,6 +26,7 @@ object ChatCache {
                 o.put("id", m.id)
                 o.put("role", m.role)
                 o.put("created", m.created)
+                o.put("completed", m.completed)
                 val blocks = JSONArray()
                 for (b in m.blocks) blocks.put(blockToJson(b))
                 o.put("blocks", blocks)
@@ -82,7 +83,7 @@ object ChatCache {
                         )
                     }
                 }
-                out.add(ChatMessage(o.optString("id"), o.optString("role"), blocks, atts, o.optLong("created")))
+                out.add(ChatMessage(o.optString("id"), o.optString("role"), blocks, atts, o.optLong("created"), o.optLong("completed")))
             }
             out
         }.getOrNull()

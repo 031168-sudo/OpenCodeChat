@@ -1,9 +1,76 @@
 package ru.alfanomy.opencodechat
 
 import android.content.Context
+import org.json.JSONArray
+import org.json.JSONObject
+
+data class Profile(val id: String, val name: String, val root: String)
 
 class Prefs(context: Context) {
     private val sp = context.getSharedPreferences("opencode_chat", Context.MODE_PRIVATE)
+
+    private fun scopedFor(id: String, base: String): String =
+        if (id.isBlank()) base else "${base}_$id"
+
+    private fun scoped(base: String): String = scopedFor(activeProfileId, base)
+
+    fun providerIdFor(id: String): String =
+        sp.getString(scopedFor(id, "providerId"), "opencode") ?: "opencode"
+
+    fun modelIdFor(id: String): String =
+        sp.getString(scopedFor(id, "modelId"), "deepseek-v4.1-flash") ?: "deepseek-v4.1-flash"
+
+    fun agentFor(id: String): String =
+        sp.getString(scopedFor(id, "agent"), "build") ?: "build"
+
+    fun variantFor(id: String): String =
+        sp.getString(scopedFor(id, "variant"), "") ?: ""
+
+    fun hiddenModelsFor(id: String): Set<String> =
+        sp.getStringSet(scopedFor(id, "hiddenModels"), emptySet()) ?: emptySet()
+
+    var activeProfileId: String
+        get() = sp.getString("activeProfileId", "") ?: ""
+        set(v) = sp.edit().putString("activeProfileId", v).apply()
+
+    var profilesJson: String
+        get() = sp.getString("profiles", "[]") ?: "[]"
+        set(v) = sp.edit().putString("profiles", v).apply()
+
+    // Первый синк с /profiles/api: локальные профили (если были) один раз
+    // добавляются на сервер. Дальше сервер — источник истины.
+    var profilesSynced: Boolean
+        get() = sp.getBoolean("profilesSynced", false)
+        set(v) = sp.edit().putBoolean("profilesSynced", v).apply()
+
+    val profiles: List<Profile>
+        get() = runCatching {
+            val arr = JSONArray(profilesJson)
+            (0 until arr.length()).mapNotNull { i ->
+                val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                val id = o.optString("id")
+                val name = o.optString("name")
+                if (id.isBlank() || name.isBlank()) return@mapNotNull null
+                Profile(id, name, o.optString("root"))
+            }
+        }.getOrDefault(emptyList())
+
+    val activeProfile: Profile?
+        get() = profiles.firstOrNull { it.id == activeProfileId }
+
+    fun saveProfiles(list: List<Profile>) {
+        val arr = JSONArray()
+        for (p in list) {
+            val root = p.root.trim().trimEnd('/')
+            arr.put(
+                JSONObject()
+                    .put("id", p.id)
+                    .put("name", p.name)
+                    .put("root", if (root == "/") "" else root)
+            )
+        }
+        profilesJson = arr.toString()
+    }
 
     var baseUrl: String
         get() = sp.getString("baseUrl", "https://gmpony.alfanomy.ru") ?: ""
@@ -42,28 +109,28 @@ class Prefs(context: Context) {
         set(v) = sp.edit().putString("password", v).apply()
 
     var providerId: String
-        get() = sp.getString("providerId", "opencode") ?: "opencode"
-        set(v) = sp.edit().putString("providerId", v).apply()
+        get() = sp.getString(scoped("providerId"), "opencode") ?: "opencode"
+        set(v) = sp.edit().putString(scoped("providerId"), v).apply()
 
     var modelId: String
-        get() = sp.getString("modelId", "deepseek-v4.1-flash") ?: "deepseek-v4.1-flash"
-        set(v) = sp.edit().putString("modelId", v).apply()
+        get() = sp.getString(scoped("modelId"), "deepseek-v4.1-flash") ?: "deepseek-v4.1-flash"
+        set(v) = sp.edit().putString(scoped("modelId"), v).apply()
 
     var agent: String
-        get() = sp.getString("agent", "build") ?: "build"
-        set(v) = sp.edit().putString("agent", v).apply()
+        get() = sp.getString(scoped("agent"), "build") ?: "build"
+        set(v) = sp.edit().putString(scoped("agent"), v).apply()
 
     var variant: String
-        get() = sp.getString("variant", "") ?: ""
-        set(v) = sp.edit().putString("variant", v).apply()
+        get() = sp.getString(scoped("variant"), "") ?: ""
+        set(v) = sp.edit().putString(scoped("variant"), v).apply()
 
     var lastSessionId: String
-        get() = sp.getString("lastSessionId", "") ?: ""
-        set(v) = sp.edit().putString("lastSessionId", v).apply()
+        get() = sp.getString(scoped("lastSessionId"), "") ?: ""
+        set(v) = sp.edit().putString(scoped("lastSessionId"), v).apply()
 
     var lastSessionTitle: String
-        get() = sp.getString("lastSessionTitle", "") ?: ""
-        set(v) = sp.edit().putString("lastSessionTitle", v).apply()
+        get() = sp.getString(scoped("lastSessionTitle"), "") ?: ""
+        set(v) = sp.edit().putString(scoped("lastSessionTitle"), v).apply()
 
     var lastScreen: String
         get() = sp.getString("lastScreen", "") ?: ""
@@ -78,8 +145,8 @@ class Prefs(context: Context) {
         set(v) = sp.edit().putLong("contextUsed", v).apply()
 
     var hiddenModels: Set<String>
-        get() = sp.getStringSet("hiddenModels", emptySet()) ?: emptySet()
-        set(v) = sp.edit().putStringSet("hiddenModels", v).apply()
+        get() = sp.getStringSet(scoped("hiddenModels"), emptySet()) ?: emptySet()
+        set(v) = sp.edit().putStringSet(scoped("hiddenModels"), v).apply()
 
     var themeMode: String
         get() = sp.getString("themeMode", "system") ?: "system"
@@ -94,12 +161,15 @@ class Prefs(context: Context) {
         set(v) = sp.edit().putFloat("fontScale", v).apply()
 
     var directory: String
-        get() = sp.getString("directory", "") ?: ""
-        set(v) = sp.edit().putString("directory", v).apply()
+        get() = sp.getString(scoped("directory"), "") ?: ""
+        set(v) = sp.edit().putString(scoped("directory"), v).apply()
 
     var parentDir: String
-        get() = sp.getString("parentDir", "/home/gmpony") ?: "/home/gmpony"
-        set(v) = sp.edit().putString("parentDir", v).apply()
+        get() = sp.getString(
+            scoped("parentDir"),
+            activeProfile?.root?.ifBlank { "/home/gmpony" } ?: "/home/gmpony"
+        ) ?: "/home/gmpony"
+        set(v) = sp.edit().putString(scoped("parentDir"), v).apply()
 
     fun isConfigured(): Boolean = baseUrl.isNotBlank() && user.isNotBlank() && password.isNotBlank()
 }
