@@ -172,6 +172,7 @@ import androidx.compose.ui.unit.sp
 import java.io.File
 import java.util.Calendar
 import java.util.Date
+import java.util.UUID
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -358,6 +359,7 @@ private fun App() {
     var tailscaleUrl by remember { mutableStateOf(prefs.tailscaleUrl) }
     var connectionMode by remember { mutableStateOf(prefs.connectionMode) }
     var speechUrl by remember { mutableStateOf(prefs.speechUrl) }
+    var defaultRoot by remember { mutableStateOf(prefs.defaultRoot) }
     var activeBaseUrl by remember { mutableStateOf(prefs.activeBaseUrl) }
     var activeKind by remember { mutableStateOf(prefs.activeKind) }
     var user by remember { mutableStateOf(prefs.user) }
@@ -630,9 +632,31 @@ private fun App() {
         loadProjectUsage()
     }
 
+    /**
+     * Если сохранённая модель не существует на этом сервере (например,
+     * приложение подключили к другому opencode), выбираем доступную.
+     */
+    fun ensureModelAvailable(list: List<ModelInfo>) {
+        if (list.isEmpty()) return
+        if (list.any { it.providerId == providerId && it.modelId == modelId }) return
+        val pick = list.firstOrNull { it.providerId == "opencode" } ?: list.first()
+        providerId = pick.providerId
+        modelId = pick.modelId
+        prefs.providerId = pick.providerId
+        prefs.modelId = pick.modelId
+        if (variant.isNotBlank() && variant !in pick.variants) {
+            variant = ""
+            prefs.variant = ""
+        }
+    }
+
     fun loadModels() {
         scope.launch {
-            models = withContext(Dispatchers.IO) { runCatching { client().listModels() }.getOrDefault(emptyList()) }
+            val loaded = withContext(Dispatchers.IO) {
+                runCatching { client().listModels() }.getOrDefault(emptyList())
+            }
+            models = loaded
+            ensureModelAvailable(loaded)
         }
     }
 
@@ -719,6 +743,7 @@ private fun App() {
         modelId = prefs.modelId
         agent = prefs.agent
         variant = prefs.variant
+        ensureModelAvailable(models)
         hiddenModels = prefs.hiddenModels
         directory = prefs.directory
         current = null
@@ -743,12 +768,12 @@ private fun App() {
 
     /**
      * /profiles/api живёт на публичном прокси (там же, где веб-UI), поэтому
-     * синхронизацию всегда ведём через публичный адрес, даже если основные
-     * запросы идут по Tailscale.
+     * синхронизацию ведём через публичный адрес, даже если основные запросы
+     * идут по Tailscale. Если публичный адрес не задан — через активный.
      */
     fun profilesClient() = ApiClient(
         prefs.baseUrl.trim().trimEnd('/').ifBlank {
-            prefs.activeBaseUrl.trim().trimEnd('/').ifBlank { "https://gmpony.alfanomy.ru" }
+            prefs.activeBaseUrl.trim().trimEnd('/')
         },
         prefs.user, prefs.password
     )
@@ -766,13 +791,18 @@ private fun App() {
                 runCatching { api.listProfiles() }
             }
             if (remoteResult.isFailure) {
-                profileSyncError = remoteResult.exceptionOrNull()?.message
+                val msg = remoteResult.exceptionOrNull()?.message
                     ?: "Не удалось загрузить профили"
+                profileSyncError = if (msg.contains("404")) {
+                    "Сервер не поддерживает /profiles/api — профили хранятся локально"
+                } else {
+                    msg
+                }
                 return@withLock false
             }
             var remote = remoteResult.getOrThrow()
 
-            if (!prefs.profilesSynced) {
+            if (!prefs.profilesSynced || prefs.profiles.any { it.id.startsWith("local-") }) {
                 val local = prefs.profiles
                 val missing = local.filter { lp ->
                     remote.none {
@@ -824,8 +854,18 @@ private fun App() {
             }
             val saved = result.getOrNull()
             if (saved == null) {
-                profileSyncError = result.exceptionOrNull()?.message
-                    ?: "Не удалось сохранить профиль"
+                // Новый/чужой сервер может не иметь /profiles/api. Профиль
+                // всё равно должен работать локально, а при появлении API
+                // синхронизация перенесёт его на сервер.
+                val local = Profile(
+                    "local-" + UUID.randomUUID().toString(),
+                    name.trim(),
+                    root.trim().trimEnd('/')
+                )
+                prefs.saveProfiles(prefs.profiles + local)
+                profiles = prefs.profiles
+                profileSyncError = "Профиль сохранён локально: сервер не поддерживает /profiles/api"
+                switchProfile(local.id)
                 return@launch
             }
             syncProfiles()
@@ -844,8 +884,19 @@ private fun App() {
             }
             val saved = result.getOrNull()
             if (saved == null) {
-                profileSyncError = result.exceptionOrNull()?.message
-                    ?: "Не удалось сохранить профиль"
+                if (p.id.startsWith("local-")) {
+                    val local = p.copy(name = p.name.trim(), root = p.root.trim().trimEnd('/'))
+                    prefs.saveProfiles(prefs.profiles.map { if (it.id == p.id) local else it })
+                    profiles = prefs.profiles
+                    if (prefs.activeProfileId == p.id) {
+                        scopePath = local.root.trimEnd('/')
+                        loadProjects()
+                    }
+                    profileSyncError = "Профиль сохранён локально: сервер не поддерживает /profiles/api"
+                } else {
+                    profileSyncError = result.exceptionOrNull()?.message
+                        ?: "Не удалось сохранить профиль"
+                }
                 return@launch
             }
             // Если профиль был только локальным, сервер выдал новый id.
@@ -875,8 +926,15 @@ private fun App() {
                 runCatching { profilesClient().deleteProfile(id) }
             }
             if (result.isFailure) {
-                profileSyncError = result.exceptionOrNull()?.message
-                    ?: "Не удалось удалить профиль"
+                if (id.startsWith("local-")) {
+                    prefs.saveProfiles(prefs.profiles.filterNot { it.id == id })
+                    profiles = prefs.profiles
+                    profileSyncError = ""
+                    if (prefs.activeProfileId == id) switchProfile("")
+                } else {
+                    profileSyncError = result.exceptionOrNull()?.message
+                        ?: "Не удалось удалить профиль"
+                }
                 return@launch
             }
             prefs.saveProfiles(prefs.profiles.filterNot { it.id == id })
@@ -887,7 +945,7 @@ private fun App() {
     }
 
     LaunchedEffect(screen) {
-        if (screen == Screen.SETTINGS) syncProfiles()
+        if (screen == Screen.SETTINGS && prefs.isConfigured()) syncProfiles()
     }
 
     fun openProfileUsage() {
@@ -1634,6 +1692,7 @@ private fun App() {
 
             projects = projectsJob.await()
             models = modelsJob.await()
+            ensureModelAvailable(models)
             agents = agentsJob.await()
             commands = commandsJob.await()
         } catch (e: Exception) {
@@ -1704,6 +1763,7 @@ private fun App() {
                     busy = busy, status = status,
                     tailscaleUrl = tailscaleUrl, connectionMode = connectionMode,
                     speechUrl = speechUrl, activeBaseUrl = activeBaseUrl,
+                    defaultRoot = defaultRoot,
                     themeMode = themeMode, fontName = fontName, fontScale = fontScale,
                     profiles = profiles, activeProfileId = activeProfileId,
                     profileSyncError = profileSyncError,
@@ -1721,6 +1781,7 @@ private fun App() {
                     onTailscaleUrl = { tailscaleUrl = it },
                     onConnectionMode = { connectionMode = it },
                     onSpeechUrl = { speechUrl = it },
+                    onDefaultRoot = { defaultRoot = it },
                     onBack = if (prefs.isConfigured()) ({ screen = settingsFrom }) else null,
                     onBaseUrl = { baseUrl = it }, onUser = { user = it }, onPassword = { password = it },
                     onSave = {
@@ -1728,6 +1789,10 @@ private fun App() {
                         prefs.tailscaleUrl = tailscaleUrl.trim()
                         prefs.connectionMode = connectionMode
                         prefs.speechUrl = speechUrl.trim()
+                        prefs.defaultRoot = defaultRoot
+                        if (prefs.parentDir.isBlank() && prefs.defaultRoot.isNotBlank()) {
+                            prefs.parentDir = prefs.defaultRoot
+                        }
                         prefs.user = user.trim()
                         prefs.password = password
                         prefs.activeBaseUrl = ""
@@ -1738,10 +1803,6 @@ private fun App() {
                                 status = "Сервер недоступен"
                             } else {
                                 val health = withContext(Dispatchers.IO) { client().health() }
-                                prefs.providerId = "opencode"
-                                prefs.modelId = "deepseek-v4.1-flash"
-                                providerId = "opencode"
-                                modelId = "deepseek-v4.1-flash"
                                 projects = withContext(Dispatchers.IO) { collectProjects() }
                                 status = "Связь есть: $health (${prefs.activeBaseUrl})"
                                 screen = Screen.PROJECTS
@@ -1758,6 +1819,7 @@ private fun App() {
                     onOpen = { openProject(it) },
                     onNew = {
                         newParent = (activeProfile?.root?.ifBlank { scopePath } ?: scopePath)
+                            .ifBlank { prefs.defaultRoot }
                             .ifBlank { prefs.parentDir }
                         newProjectError = ""
                         showNewProject = true
@@ -2033,6 +2095,7 @@ private fun App() {
 private fun SettingsScreen(
     baseUrl: String, user: String, password: String, busy: Boolean, status: String,
     tailscaleUrl: String, connectionMode: String, speechUrl: String, activeBaseUrl: String,
+    defaultRoot: String,
     themeMode: String, fontName: String, fontScale: Float,
     profiles: List<Profile>, activeProfileId: String,
     profileSyncError: String, profileSyncing: Boolean,
@@ -2045,6 +2108,7 @@ private fun SettingsScreen(
     onDeleteProfile: (String) -> Unit,
     onThemeMode: (String) -> Unit, onFontName: (String) -> Unit, onFontScale: (Float) -> Unit,
     onTailscaleUrl: (String) -> Unit, onConnectionMode: (String) -> Unit, onSpeechUrl: (String) -> Unit,
+    onDefaultRoot: (String) -> Unit,
     onBack: (() -> Unit)?,
     onBaseUrl: (String) -> Unit, onUser: (String) -> Unit, onPassword: (String) -> Unit,
     onSave: () -> Unit
@@ -2066,6 +2130,15 @@ private fun SettingsScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(20.dp)
         ) {
+            if (baseUrl.isBlank() && tailscaleUrl.isBlank()) {
+                Text(
+                    "Первый запуск. Укажите адрес сервера opencode, логин и пароль. " +
+                        "Адрес по Tailscale нужен только при подключении через Tailscale.",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.height(16.dp))
+            }
             Text("Оформление", fontWeight = FontWeight.Bold, fontSize = 18.sp)
             Spacer(Modifier.height(8.dp))
             Text("Тема", fontWeight = FontWeight.Bold)
@@ -2137,19 +2210,31 @@ private fun SettingsScreen(
             Text("Публичный адрес", fontWeight = FontWeight.Bold)
             OutlinedTextField(
                 baseUrl, onBaseUrl, Modifier.fillMaxWidth(), singleLine = true,
-                placeholder = { Text("https://gmpony.alfanomy.ru") }
+                placeholder = { Text("https://opencode.example.com") }
             )
             Spacer(Modifier.height(10.dp))
             Text("Адрес по Tailscale", fontWeight = FontWeight.Bold)
             OutlinedTextField(
                 tailscaleUrl, onTailscaleUrl, Modifier.fillMaxWidth(), singleLine = true,
-                placeholder = { Text("http://100.75.84.42:4096") }
+                placeholder = { Text("http://100.x.x.x:4096") }
             )
             Spacer(Modifier.height(10.dp))
             Text("Адрес распознавания речи (необязательно)", fontWeight = FontWeight.Bold)
             OutlinedTextField(
                 speechUrl, onSpeechUrl, Modifier.fillMaxWidth(), singleLine = true,
                 placeholder = { Text("пусто — определится автоматически") }
+            )
+            Spacer(Modifier.height(10.dp))
+            Text("Корень проектов (необязательно)", fontWeight = FontWeight.Bold)
+            OutlinedTextField(
+                defaultRoot, onDefaultRoot, Modifier.fillMaxWidth(), singleLine = true,
+                placeholder = { Text("/home/пользователь/проекты") }
+            )
+            Text(
+                "Отсюда создаются новые проекты, если у профиля не задана своя папка. " +
+                    "Пусто — /.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(4.dp))
             Text(
@@ -2260,6 +2345,11 @@ private fun SettingsScreen(
                     }
                 }
             )
+            Text(
+                "Пусто — если сервер без авторизации.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             Spacer(Modifier.height(20.dp))
             Button(onClick = onSave, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
                 Text(if (busy) "Проверка…" else "Сохранить и проверить связь")
@@ -2275,6 +2365,7 @@ private fun SettingsScreen(
     if (showProfileDialog) {
         ProfileEditDialog(
             initial = editingProfile,
+            defaultRoot = defaultRoot,
             onDismiss = { showProfileDialog = false },
             onSave = { name, root ->
                 val e = editingProfile
@@ -2306,11 +2397,14 @@ private fun SettingsScreen(
 @Composable
 private fun ProfileEditDialog(
     initial: Profile?,
+    defaultRoot: String,
     onDismiss: () -> Unit,
     onSave: (String, String) -> Unit
 ) {
     var name by remember(initial?.id) { mutableStateOf(initial?.name ?: "") }
-    var root by remember(initial?.id) { mutableStateOf(initial?.root ?: "") }
+    var root by remember(initial?.id, defaultRoot) {
+        mutableStateOf(initial?.root ?: if (initial == null) defaultRoot else "")
+    }
     val rootValid = root.isBlank() || root.trim().startsWith("/")
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -2331,11 +2425,11 @@ private fun ProfileEditDialog(
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     label = { Text("Папка проектов") },
-                    placeholder = { Text("/home/gmpony/work/alice") },
+                    placeholder = { Text("/home/пользователь/проекты") },
                     isError = !rootValid
                 )
                 Text(
-                    if (!rootValid) "Нужен абсолютный путь, например /home/gmpony/work/alice"
+                    if (!rootValid) "Нужен абсолютный путь, например /home/пользователь/проекты"
                     else "Папка создастся при первом проекте. Пусто — все проекты.",
                     fontSize = 11.sp,
                     color = if (!rootValid) MaterialTheme.colorScheme.error

@@ -21,17 +21,40 @@
 
 ## Сборка
 
+Локально:
+
 ```bash
-ANDROID_HOME=/home/gmpony/Android/Sdk \
-/home/gmpony/opt/gradle/gradle-8.11.1/bin/gradle :app:assembleDebug --offline
+ANDROID_HOME=/path/to/Android/Sdk ./gradlew :app:assembleDebug --offline
 ```
 
 APK: `app/build/outputs/apk/debug/app-debug.apk`.
 
+На GitHub: workflow `.github/workflows/android.yml` собирает debug-APK
+при пуше в `main`, в pull request и вручную (`workflow_dispatch`).
+Готовый файл лежит в артефактах запуска (`OpenCodeChat-debug-apk`).
+
+Важно: debug-APK, собранный в CI, может быть подписан другим отладочным
+ключом, чем предыдущая сборка. Если обновление не устанавливается поверх,
+удали старое приложение. Для стабильных обновлений нужен постоянный
+keystore и release-подпись.
+
 ## Настройка
 
-При первом запуске укажи адрес сервера opencode, логин и пароль
-(HTTP Basic). По умолчанию используется `https://gmpony.alfanomy.ru`.
+При первом запуске приложение открывает настройки. Укажи:
+
+- адрес сервера opencode (публичный HTTPS или локальный/Tailscale);
+- логин и пароль (HTTP Basic, обычно проверяет reverse proxy; пароль можно
+  оставить пустым, если сервер без авторизации);
+- при необходимости — корень проектов, например `/home/user/projects`.
+
+По умолчанию адрес сервера не задан. Модель выбирается из доступных на
+сервере; если сохранённой модели там нет, приложение подставит первую
+доступную.
+
+Стандартный opencode работает без дополнительных серверных компонентов.
+Синхронизация профилей через `/profiles/api` и голосовой ввод через
+`/speech/inference` — необязательные функции: без них профили хранятся
+локально, а основные чаты работают как обычно.
 
 ## APK
 

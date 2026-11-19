@@ -73,12 +73,17 @@ class Prefs(context: Context) {
     }
 
     var baseUrl: String
-        get() = sp.getString("baseUrl", "https://gmpony.alfanomy.ru") ?: ""
+        get() = sp.getString("baseUrl", "") ?: ""
         set(v) = sp.edit().putString("baseUrl", v).apply()
 
     var tailscaleUrl: String
-        get() = sp.getString("tailscaleUrl", "http://100.75.84.42:4096") ?: ""
+        get() = sp.getString("tailscaleUrl", "") ?: ""
         set(v) = sp.edit().putString("tailscaleUrl", v).apply()
+
+    /** Корень для новых проектов, если у профиля не задана своя папка. */
+    var defaultRoot: String
+        get() = sp.getString("defaultRoot", "") ?: ""
+        set(v) = sp.edit().putString("defaultRoot", v.trim().trimEnd('/')).apply()
 
     var connectionMode: String
         get() = sp.getString("connectionMode", "auto") ?: "auto"
@@ -167,9 +172,10 @@ class Prefs(context: Context) {
     var parentDir: String
         get() = sp.getString(
             scoped("parentDir"),
-            activeProfile?.root?.ifBlank { "/home/gmpony" } ?: "/home/gmpony"
-        ) ?: "/home/gmpony"
+            ""
+        ) ?: ""
         set(v) = sp.edit().putString(scoped("parentDir"), v).apply()
 
-    fun isConfigured(): Boolean = baseUrl.isNotBlank() && user.isNotBlank() && password.isNotBlank()
+    fun isConfigured(): Boolean =
+        (baseUrl.isNotBlank() || tailscaleUrl.isNotBlank()) && user.isNotBlank()
 }
