@@ -330,12 +330,15 @@ class ApiClient(
         return out
     }
 
-    private fun isTextLike(mime: String, path: String): Boolean {
+    fun isTextLike(mime: String, path: String): Boolean {
         val m = mime.lowercase()
         if (m.startsWith("text/")) return true
         if (m.contains("json") || m.contains("xml") || m.contains("javascript") ||
             m.contains("x-sh") || m.contains("yaml") || m.contains("toml")
         ) return true
+        val name = path.trimEnd('/').substringAfterLast('/').lowercase()
+        if (name in setOf("dockerfile", "makefile", "rakefile", "procfile", "license",
+                "readme", "changelog", "authors", "notice")) return true
         val ext = path.substringAfterLast('.', "").lowercase()
         return ext in setOf(
             "kt", "kts", "java", "md", "txt", "json", "xml", "yaml", "yml",
@@ -413,6 +416,40 @@ class ApiClient(
             ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
         conn.disconnect()
         if (code !in 200..299) throw RuntimeException("HTTP $code: ${resp.take(300)}")
+    }
+
+    /** Скачивает файл с сервера потоком в out (без ограничений предпросмотра). */
+    fun fsDownload(directory: String, path: String, out: java.io.OutputStream): Long {
+        val url = URL(
+            baseUrl.trimEnd('/') + "/api/fs/read/" + encFsPath(path) +
+                "?" + locationQuery(directory)
+        )
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "GET"
+        conn.connectTimeout = 15000
+        conn.readTimeout = 300000
+        conn.setRequestProperty("Authorization", authHeader())
+        val code = conn.responseCode
+        if (code !in 200..299) {
+            val err = conn.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+            conn.disconnect()
+            throw RuntimeException("HTTP $code: ${err.take(300)}")
+        }
+        var total = 0L
+        try {
+            conn.inputStream.use { input ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    total += n
+                }
+            }
+        } finally {
+            conn.disconnect()
+        }
+        return total
     }
 
     private fun ptyRun(directory: String, script: String, title: String) {
