@@ -31,11 +31,31 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Cache debug keystore
-        uses: actions/cache@v4
+      - name: Restore debug keystore
+        id: keystore-cache
+        uses: actions/cache/restore@v4
         with:
-          path: ~/.android/debug.keystore
-          key: android-debug-keystore-v1
+          path: ~/.android
+          key: android-debug-keystore-v2
+
+      - name: Ensure debug keystore
+        run: |
+          set -e
+          mkdir -p "$HOME/.android"
+          KS="$HOME/.android/debug.keystore"
+          if [ ! -s "$KS" ]; then
+            keytool -genkeypair -keystore "$KS" -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US" >/dev/null
+          fi
+          keytool -list -keystore "$KS" -storepass android | head -3
+
+      - name: Save debug keystore
+        if: steps.keystore-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.android
+          key: android-debug-keystore-v2
 
       - name: Install Android SDK packages
         run: |

@@ -23,9 +23,15 @@ opencode**. Позволяет работать с opencode с телефона 
 Run workflow в интерфейсе GitHub). Результат — артефакт
 `OpenCodeChat-debug-apk` с `app-debug.apk` внутри.
 
-- Debug-APK из CI может быть подписан другим отладочным ключом, чем
-  предыдущая сборка; для установки поверх может потребоваться удалить
-  старое приложение. Для стабильных обновлений нужен постоянный keystore.
+- Debug-APK из CI подписывается постоянным debug-ключом, который workflow
+  создаёт сам и кэширует (`~/.android`, ключ `android-debug-keystore-v2`);
+  `app/build.gradle.kts` берёт его явно (`signingConfigs.ci`, путь можно
+  переопределить переменной `DEBUG_KEYSTORE_PATH`). Поэтому обновления
+  ставятся поверх. Если кэш Actions вычистится (7 дней без сборок), ключ
+  сгенерируется заново и для установки придётся один раз удалить приложение;
+  для полной независимости нужен постоянный keystore в Secrets.
+- APK каждой успешной сборки `main` публикуется в GitHub Releases:
+  **https://github.com/031168-sudo/OpenCodeChat/releases/latest/download/opencode-chat-debug.apk**
 
 ## Публикация
 

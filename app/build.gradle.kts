@@ -20,6 +20,24 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    signingConfigs {
+        // Постоянный debug-ключ: в CI лежит в кэше Actions, локально — обычный
+        // $HOME/.android/debug.keystore. Без него каждая сборка подписывалась
+        // новым ключом и APK не ставился поверх предыдущего.
+        create("ci") {
+            val path = System.getenv("DEBUG_KEYSTORE_PATH")
+                ?: (System.getProperty("user.home") + "/.android/debug.keystore")
+            storeFile = file(path)
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+    buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("ci")
+        }
+    }
 }
 
 dependencies {
