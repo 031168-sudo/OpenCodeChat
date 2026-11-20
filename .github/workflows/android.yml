@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: android-${{ github.ref }}
@@ -52,3 +52,23 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish APK to Releases
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/apk"
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             "$RUNNER_TEMP/apk/opencode-chat-debug.apk"
+          cd "$RUNNER_TEMP/apk"
+          NOTES="Сборка от $(date -u '+%Y-%m-%d %H:%M UTC'), коммит ${GITHUB_SHA:0:7}"
+          if gh release view build >/dev/null 2>&1; then
+            gh release upload build opencode-chat-debug.apk --clobber
+            gh release edit build --notes "$NOTES" --latest
+          else
+            gh release create build opencode-chat-debug.apk \
+              --title "OpenCode — debug APK" --notes "$NOTES" --latest
+          fi
+          echo "APK: https://github.com/${{ github.repository }}/releases/latest/download/opencode-chat-debug.apk"
