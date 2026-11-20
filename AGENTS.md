@@ -7,22 +7,22 @@ opencode**. Позволяет работать с opencode с телефона 
 интерфейс, а не через веб в браузере.
 
 - Пакет: `ru.alfanomy.opencodechat`
-- Исходники: `/home/gmpony/OpenCodeChat`
+- Исходники: `/home/andrey/OpenCodeChat`
 - Код: `app/src/main/java/ru/alfanomy/opencodechat/`
   - `MainActivity.kt` — UI (экраны SETTINGS / SESSIONS / CHAT)
   - `ApiClient.kt` — HTTP-клиент к API opencode
   - `Prefs.kt` — настройки (адрес, логин, пароль, модель)
 
-## Сборка (локально)
+## Сборка
 
-```bash
-ANDROID_HOME=/home/gmpony/Android/Sdk ./gradlew :app:assembleDebug --offline
-```
+Только в GitHub Actions, на машине разработки не собирается: она слабая
+(1 CPU, 2.9 ГБ RAM), JDK, Gradle и Android SDK здесь не ставятся.
 
-- APK: `app/build/outputs/apk/debug/app-debug.apk`
-- В репозитории есть Gradle wrapper и GitHub Actions
-  (`.github/workflows/android.yml`): при пуше в `main`, в PR и вручную
-  собирается debug-APK и загружается артефактом `OpenCodeChat-debug-apk`.
+Пайплайн `.github/workflows/android.yml` (`ubuntu-latest`, JDK 17, Android SDK)
+запускается на пуш в `main`, на PR и вручную (`workflow_dispatch` — кнопка
+Run workflow в интерфейсе GitHub). Результат — артефакт
+`OpenCodeChat-debug-apk` с `app-debug.apk` внутри.
+
 - Debug-APK из CI может быть подписан другим отладочным ключом, чем
   предыдущая сборка; для установки поверх может потребоваться удалить
   старое приложение. Для стабильных обновлений нужен постоянный keystore.
