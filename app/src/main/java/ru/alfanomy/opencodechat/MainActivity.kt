@@ -2831,7 +2831,7 @@ private fun FilesScreen(
                     val t = r.text
                     when {
                         t == null -> status = "Это не текстовый файл — редактор не откроется"
-                        r.size > 2_000_000 -> status = "Файл больше 2 МБ — редактор не откроется"
+                        r.size > 1_000_000 -> status = "Файл больше 1 МБ — редактор не откроется"
                         else -> {
                             editTarget = target
                             editText = t
