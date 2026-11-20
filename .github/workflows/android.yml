@@ -57,6 +57,7 @@ jobs:
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -e
           mkdir -p "$RUNNER_TEMP/apk"
