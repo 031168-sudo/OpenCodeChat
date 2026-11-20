@@ -4,16 +4,21 @@ import android.app.Activity
 import android.app.DatePickerDialog
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.Manifest
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.text.format.DateFormat
 import android.util.Base64
+import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -142,6 +147,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -169,6 +175,9 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.util.Calendar
 import java.util.Date
@@ -2711,6 +2720,14 @@ private fun FilesScreen(
     var entryMenuPath by remember { mutableStateOf<String?>(null) }
     var newFolder by remember { mutableStateOf(false) }
     var newFolderName by remember { mutableStateOf("") }
+    var editTarget by remember { mutableStateOf<FsEntry?>(null) }
+    var editText by remember { mutableStateOf("") }
+    var editOriginal by remember { mutableStateOf("") }
+    var editSaving by remember { mutableStateOf(false) }
+    var editError by remember { mutableStateOf("") }
+    var pendingDownload by remember { mutableStateOf<FsEntry?>(null) }
+
+    fun fileNameOf(p: String): String = p.trimEnd('/').substringAfterLast('/')
 
     fun refresh() {
         scope.launch {
@@ -2736,10 +2753,116 @@ private fun FilesScreen(
         if (query.isBlank()) refresh() else search()
     }
 
+    val createDocLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        val target = pendingDownload
+        pendingDownload = null
+        if (uri != null && target != null) {
+            scope.launch {
+                loading = true
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openOutputStream(uri)?.use { out ->
+                            api.fsDownload(directory, target.path, out)
+                        } ?: throw RuntimeException("Не удалось открыть файл")
+                    }
+                    status = "Сохранено: ${fileNameOf(target.path)}"
+                }.onFailure { status = it.message ?: "Ошибка скачивания" }
+                loading = false
+            }
+        }
+    }
+
     LaunchedEffect(path, query) {
         if (query.isBlank()) refresh() else {
             delay(300)
             search()
+        }
+    }
+
+    fun saveToDownloads(target: FsEntry) {
+        val name = fileNameOf(target.path)
+        val mime = fileMime(name)
+        if (Build.VERSION.SDK_INT >= 29) {
+            scope.launch {
+                loading = true
+                status = ""
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        val resolver = context.contentResolver
+                        val values = ContentValues().apply {
+                            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                            put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                            put(MediaStore.MediaColumns.IS_PENDING, 1)
+                        }
+                        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                            ?: throw RuntimeException("Не удалось создать файл в «Загрузках»")
+                        try {
+                            resolver.openOutputStream(uri)?.use { out ->
+                                api.fsDownload(directory, target.path, out)
+                            } ?: throw RuntimeException("Не удалось открыть поток записи")
+                            val done = ContentValues().apply {
+                                put(MediaStore.MediaColumns.IS_PENDING, 0)
+                            }
+                            resolver.update(uri, done, null, null)
+                        } catch (e: Exception) {
+                            resolver.delete(uri, null, null)
+                            throw e
+                        }
+                    }
+                    status = "Сохранено в «Загрузки»: $name"
+                }.onFailure { status = it.message ?: "Ошибка скачивания" }
+                loading = false
+            }
+        } else {
+            pendingDownload = target
+            createDocLauncher.launch(name)
+        }
+    }
+
+    fun openEditor(target: FsEntry) {
+        scope.launch {
+            loading = true
+            status = ""
+            runCatching { withContext(Dispatchers.IO) { api.fsRead(directory, target.path) } }
+                .onSuccess { r ->
+                    val t = r.text
+                    when {
+                        t == null -> status = "Это не текстовый файл — редактор не откроется"
+                        r.size > 2_000_000 -> status = "Файл больше 2 МБ — редактор не откроется"
+                        else -> {
+                            editTarget = target
+                            editText = t
+                            editOriginal = t
+                            editError = ""
+                        }
+                    }
+                }
+                .onFailure { status = it.message ?: "Ошибка чтения" }
+            loading = false
+        }
+    }
+
+    fun saveEditor() {
+        val target = editTarget ?: return
+        editSaving = true
+        editError = ""
+        scope.launch {
+            runCatching {
+                val bytes = editText.toByteArray(Charsets.UTF_8)
+                withContext(Dispatchers.IO) {
+                    ByteArrayInputStream(bytes).use { input ->
+                        api.fsWrite(directory, target.path, input, bytes.size.toLong())
+                    }
+                }
+            }.onSuccess {
+                editTarget = null
+                status = "Сохранено: ${fileNameOf(target.path)}"
+                reload()
+            }.onFailure { editError = it.message ?: "Ошибка сохранения" }
+            editSaving = false
         }
     }
 
@@ -2886,6 +3009,24 @@ private fun FilesScreen(
                                 expanded = entryMenuPath == e.path,
                                 onDismissRequest = { entryMenuPath = null }
                             ) {
+                                if (!isDir) {
+                                    DropdownMenuItem(
+                                        text = { Text("Скачать на телефон") },
+                                        onClick = {
+                                            entryMenuPath = null
+                                            saveToDownloads(e)
+                                        }
+                                    )
+                                    if (api.isTextLike("", e.path)) {
+                                        DropdownMenuItem(
+                                            text = { Text("Редактировать") },
+                                            onClick = {
+                                                entryMenuPath = null
+                                                openEditor(e)
+                                            }
+                                        )
+                                    }
+                                }
                                 DropdownMenuItem(
                                     text = { Text("Переименовать") },
                                     onClick = {
@@ -2923,7 +3064,28 @@ private fun FilesScreen(
         FilePreviewDialog(
             name = previewName,
             data = preview!!,
-            onDismiss = { preview = null }
+            onDismiss = { preview = null },
+            onDownload = {
+                preview = null
+                saveToDownloads(FsEntry(previewName, "file"))
+            },
+            onEdit = {
+                preview = null
+                openEditor(FsEntry(previewName, "file"))
+            }
+        )
+    }
+
+    if (editTarget != null) {
+        FileEditorDialog(
+            name = editTarget!!.path,
+            text = editText,
+            dirty = editText != editOriginal,
+            saving = editSaving,
+            error = editError,
+            onTextChange = { editText = it },
+            onSave = { saveEditor() },
+            onCancel = { editTarget = null }
         )
     }
 
@@ -3041,7 +3203,10 @@ private fun FilesScreen(
 }
 
 @Composable
-private fun FilePreviewDialog(name: String, data: FsRead, onDismiss: () -> Unit) {
+private fun FilePreviewDialog(
+    name: String, data: FsRead, onDismiss: () -> Unit,
+    onDownload: () -> Unit, onEdit: () -> Unit
+) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
@@ -3093,8 +3258,85 @@ private fun FilePreviewDialog(name: String, data: FsRead, onDismiss: () -> Unit)
                 else -> Text("Бинарный файл (${fmtNum(data.size)} байт). Просмотр не поддерживается.")
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } }
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onDownload) { Text("Скачать") }
+                if (data.text != null) {
+                    TextButton(onClick = onEdit) { Text("Редактировать") }
+                }
+            }
+        }
     )
+}
+
+/** Полноэкранный текстовый редактор для файлов проекта. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FileEditorDialog(
+    name: String, text: String, dirty: Boolean, saving: Boolean, error: String,
+    onTextChange: (String) -> Unit, onSave: () -> Unit, onCancel: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = { if (!saving) onCancel() },
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(Modifier.fillMaxSize()) {
+            Scaffold(
+                topBar = {
+                    TopAppBar(
+                        title = {
+                            Column {
+                                Text(
+                                    name.trimEnd('/').substringAfterLast('/'),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    fontSize = 15.sp
+                                )
+                                Text(
+                                    if (error.isNotBlank()) error else if (dirty) "Изменено" else name,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    fontSize = 11.sp,
+                                    color = if (error.isNotBlank()) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        },
+                        navigationIcon = {
+                            TextButton(onClick = onCancel, enabled = !saving) { Text("← Отмена") }
+                        },
+                        actions = {
+                            TextButton(onClick = onSave, enabled = dirty && !saving) {
+                                Text(if (saving) "Сохраняю…" else "Сохранить")
+                            }
+                        }
+                    )
+                }
+            ) { pad ->
+                BasicTextField(
+                    value = text,
+                    onValueChange = onTextChange,
+                    textStyle = LocalTextStyle.current.copy(
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 13.sp
+                    ),
+                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                    modifier = Modifier
+                        .padding(pad)
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+private fun fileMime(name: String): String {
+    val ext = name.substringAfterLast('.', "").lowercase()
+    return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+        ?: "application/octet-stream"
 }
 
 @Composable
