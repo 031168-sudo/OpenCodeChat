@@ -5032,7 +5032,7 @@ private fun NewProjectDialog(
 private val inlineMd = Regex(
     "\\[([^\\]]+)\\]\\(([^)\\s]+)\\)" +
         "|https?://[^\\s)\\]]+" +
-        "|`([^`]+)`" +
+        "|(`{1,3})([^`].*?)\\3" +
         "|\\*\\*([^*]+)\\*\\*"
 )
 
@@ -5053,12 +5053,12 @@ private fun AnnotatedString.Builder.appendInlineMarkdown(text: String, linkColor
             value.startsWith("http") ->
                 withLink(LinkAnnotation.Url(value, linkStyle)) { append(value) }
 
-            m.groups[3] != null ->
-                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(m.groupValues[3]) }
-
             m.groups[4] != null ->
+                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(m.groupValues[4].trim()) }
+
+            m.groups[5] != null ->
                 withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                    appendInlineMarkdown(m.groupValues[4], linkColor)
+                    appendInlineMarkdown(m.groupValues[5], linkColor)
                 }
         }
         i = m.range.last + 1
@@ -5067,11 +5067,14 @@ private fun AnnotatedString.Builder.appendInlineMarkdown(text: String, linkColor
 }
 
 private val urlJoin = Regex("(https?://[^\\s)\\]]+)\\n(/[^\\s)\\]]*)")
+
+/** Начало/конец блока кода: ``` или ```язык и больше ничего в строке. */
+private val codeFence = Regex("^\\s*```[A-Za-z0-9_+.\\-]*\\s*$")
 private fun markdown(text: String, linkColor: Color): AnnotatedString = buildAnnotatedString {
     val lines = text.replace(urlJoin, "$1$2").split("\n")
     var inCode = false
     lines.forEachIndexed { idx, line ->
-        if (line.trimStart().startsWith("```")) {
+        if (codeFence.matches(line)) {
             inCode = !inCode
         } else if (inCode) {
             withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(line) }
@@ -5126,7 +5129,7 @@ private fun markdownParts(text: String): List<Any> {
     var i = 0
     while (i < lines.size) {
         val line = lines[i]
-        if (line.trimStart().startsWith("```")) {
+        if (codeFence.matches(line)) {
             inCode = !inCode
             buf.add(line)
             i++
