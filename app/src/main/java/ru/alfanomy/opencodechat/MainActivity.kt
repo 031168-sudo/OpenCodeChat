@@ -85,6 +85,7 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Person
@@ -3617,8 +3618,10 @@ private fun ChatScreen(
     val attachLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) onAttach(uri)
     }
-    val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) onAttach(uri)
+    val galleryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(20)
+    ) { uris ->
+        uris.forEach { onAttach(it) }
     }
 
     var pendingCameraUri by rememberSaveable { mutableStateOf<String?>(null) }
@@ -3721,6 +3724,19 @@ private fun ChatScreen(
         derivedStateOf {
             val info = listState.layoutInfo
             info.totalItemsCount == 0 || info.visibleItemsInfo.lastOrNull()?.index == info.totalItemsCount - 1
+        }
+    }
+    // Ответ, внутри которого сейчас верх экрана — к его началу ведёт верхняя стрелка.
+    val answerStartIndex by remember(messages) {
+        derivedStateOf {
+            val first = listState.firstVisibleItemIndex
+            if (first in messages.indices && messages[first].role == "assistant") first else -1
+        }
+    }
+    val canScrollToAnswerStart by remember {
+        derivedStateOf {
+            val t = answerStartIndex
+            t >= 0 && (listState.firstVisibleItemIndex > t || listState.firstVisibleItemScrollOffset > 0)
         }
     }
     var stickToBottom by remember(sessionId) { mutableStateOf(true) }
@@ -4028,6 +4044,31 @@ private fun ChatScreen(
                     }
                 }
                 item { Spacer(Modifier.height(1.dp)) }
+            }
+            if (canScrollToAnswerStart) {
+                Surface(
+                    onClick = {
+                        listScope.launch {
+                            val t = answerStartIndex
+                            if (t >= 0) listState.animateScrollToItem(t)
+                        }
+                    },
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f),
+                    shadowElevation = 2.dp,
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 12.dp, bottom = if (!atBottom) 56.dp else 8.dp)
+                        .size(40.dp)
+                ) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Filled.KeyboardArrowUp,
+                            contentDescription = "К началу ответа",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
             if (!atBottom) {
                 Surface(
