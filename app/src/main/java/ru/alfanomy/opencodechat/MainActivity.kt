@@ -1093,6 +1093,11 @@ private fun App() {
     /** Откатить сессию до указанного вопроса (включительно) и перечитать историю. */
     fun revertToMessage(messageId: String) {
         val s = current ?: return
+        // как в вебе: откат удаляет вопрос с сервера, его текст возвращается в поле ввода
+        val original = messages.firstOrNull { it.id == messageId }
+        val question = original?.blocks?.filterIsInstance<TextBlock>()
+            ?.joinToString("\n\n") { it.text }.orEmpty().trim()
+        val files = original?.attachments.orEmpty()
         scope.launch {
             busy = true
             try {
@@ -1105,6 +1110,8 @@ private fun App() {
                 historyCursor = null
                 historyHasMore = true
                 historyLoading = false
+                if (question.isNotBlank()) input = question
+                if (files.isNotEmpty()) attachments = files
             } catch (e: Exception) {
                 status = e.message ?: "Ошибка"
             } finally {
