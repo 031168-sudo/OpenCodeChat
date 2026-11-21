@@ -4440,7 +4440,7 @@ private fun CircleButton(
 private fun BlockView(block: Block, linkColor: Color) {
     when (block) {
         is TextBlock -> if (block.text.isNotBlank()) {
-            Text(markdown(block.text, linkColor), fontSize = 15.sp)
+            MarkdownView(block.text, linkColor)
         }
         is ReasoningBlock -> {
             Column(Modifier.padding(vertical = 4.dp)) {
@@ -5066,7 +5066,6 @@ private fun AnnotatedString.Builder.appendInlineMarkdown(text: String, linkColor
 }
 
 private val urlJoin = Regex("(https?://[^\\s)\\]]+)\\n(/[^\\s)\\]]*)")
-
 private fun markdown(text: String, linkColor: Color): AnnotatedString = buildAnnotatedString {
     val lines = text.replace(urlJoin, "$1$2").split("\n")
     var inCode = false
@@ -5079,5 +5078,138 @@ private fun markdown(text: String, linkColor: Color): AnnotatedString = buildAnn
             appendInlineMarkdown(line, linkColor)
         }
         if (idx < lines.lastIndex) append("\n")
+    }
+}
+
+// --- markdown-таблицы -------------------------------------------------------
+
+private data class MdTable(val header: List<String>, val rows: List<List<String>>)
+
+private val tableSeparator = Regex("^:?-{2,}:?$")
+
+private fun splitTableRow(line: String): List<String> {
+    var s = line.trim()
+    if (s.startsWith("|")) s = s.substring(1)
+    if (s.endsWith("|")) s = s.dropLast(1)
+    return s.split("|").map { it.trim() }
+}
+
+private fun parseTableAt(lines: List<String>, start: Int): Pair<MdTable, Int>? {
+    if (start + 1 >= lines.size) return null
+    if (!lines[start].trim().startsWith("|")) return null
+    if (!lines[start + 1].trim().startsWith("|")) return null
+    val sep = splitTableRow(lines[start + 1])
+    if (sep.isEmpty() || !sep.all { tableSeparator.matches(it.replace(" ", "")) }) return null
+    val header = splitTableRow(lines[start])
+    val rows = ArrayList<List<String>>()
+    var i = start + 2
+    while (i < lines.size && lines[i].trim().startsWith("|")) {
+        rows.add(splitTableRow(lines[i]))
+        i++
+    }
+    return MdTable(header, rows) to i
+}
+
+/** Делит текст на обычные куски и таблицы; блоки кода не трогает. */
+private fun markdownParts(text: String): List<Any> {
+    val lines = text.split("\n")
+    val parts = ArrayList<Any>()
+    val buf = ArrayList<String>()
+    fun flush() {
+        if (buf.isNotEmpty()) {
+            parts.add(buf.joinToString("\n"))
+            buf.clear()
+        }
+    }
+    var inCode = false
+    var i = 0
+    while (i < lines.size) {
+        val line = lines[i]
+        if (line.trimStart().startsWith("```")) {
+            inCode = !inCode
+            buf.add(line)
+            i++
+            continue
+        }
+        if (!inCode) {
+            val table = parseTableAt(lines, i)
+            if (table != null) {
+                flush()
+                parts.add(table.first)
+                i = table.second
+                continue
+            }
+        }
+        buf.add(line)
+        i++
+    }
+    flush()
+    return parts
+}
+
+@Composable
+private fun MarkdownView(text: String, linkColor: Color) {
+    val parts = remember(text) { markdownParts(text.replace(urlJoin, "$1$2")) }
+    Column {
+        parts.forEach { part ->
+            when (part) {
+                is MdTable -> TableView(part, linkColor)
+                else -> {
+                    val s = part as String
+                    if (s.isNotBlank()) Text(markdown(s, linkColor), fontSize = 15.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TableView(table: MdTable, linkColor: Color) {
+    val columns = maxOf(
+        table.header.size,
+        table.rows.maxOfOrNull { it.size } ?: 0
+    )
+    if (columns == 0) return
+    val cellWidths = remember(table) {
+        (0 until columns).map { c ->
+            val longest = (listOf(table.header.getOrNull(c) ?: "") +
+                table.rows.map { it.getOrNull(c) ?: "" }).maxOf { it.length }
+            (longest.coerceIn(5, 36) * 7.2f).dp
+        }
+    }
+    val divider = MaterialTheme.colorScheme.outlineVariant
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp)
+            .horizontalScroll(rememberScrollState())
+            .clip(RoundedCornerShape(8.dp))
+    ) {
+        Row(Modifier.background(MaterialTheme.colorScheme.surfaceVariant)) {
+            for (c in 0 until columns) {
+                TableCell(table.header.getOrNull(c) ?: "", cellWidths[c], linkColor, true)
+            }
+        }
+        table.rows.forEachIndexed { index, row ->
+            Row {
+                for (c in 0 until columns) {
+                    TableCell(row.getOrNull(c) ?: "", cellWidths[c], linkColor, false)
+                }
+            }
+            if (index < table.rows.lastIndex) {
+                Box(Modifier.fillMaxWidth().height(1.dp).background(divider))
+            }
+        }
+    }
+}
+
+@Composable
+private fun TableCell(text: String, width: androidx.compose.ui.unit.Dp, linkColor: Color, header: Boolean) {
+    Box(Modifier.width(width).padding(horizontal = 8.dp, vertical = 6.dp)) {
+        Text(
+            markdown(text, linkColor),
+            fontSize = 13.sp,
+            fontWeight = if (header) FontWeight.SemiBold else FontWeight.Normal
+        )
     }
 }
