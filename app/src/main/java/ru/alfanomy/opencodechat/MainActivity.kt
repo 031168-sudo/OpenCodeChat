@@ -182,6 +182,7 @@ import java.io.File
 import java.util.Calendar
 import java.util.Date
 import java.util.UUID
+import kotlin.math.absoluteValue
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -262,6 +263,19 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         resumeHandler?.invoke()
     }
+}
+
+/** Одна папка может встретиться дважды: переименование в вебе создаёт новую
+ *  запись проекта, а старая остаётся. Берём более свежую, но имя и иконку —
+ *  из той, где они заданы. */
+private fun preferredProject(a: Project, b: Project): Project {
+    val newer = if (b.updated >= a.updated) b else a
+    val older = if (newer === a) b else a
+    return newer.copy(
+        name = newer.name.ifBlank { older.name },
+        iconColor = newer.iconColor ?: older.iconColor,
+        iconUrl = newer.iconUrl ?: older.iconUrl
+    )
 }
 
 private fun usableProjects(list: List<Project>): List<Project> =
@@ -555,7 +569,9 @@ private fun App() {
     fun collectProjects(): List<Project> {
         val map = LinkedHashMap<String, Project>()
         for (p in runCatching { client().listProjects() }.getOrDefault(emptyList())) {
-            if (p.worktree.isNotBlank()) map[p.worktree] = p
+            if (p.worktree.isBlank()) continue
+            val prev = map[p.worktree]
+            map[p.worktree] = if (prev == null) p else preferredProject(prev, p)
         }
         for (d in runCatching { client().listSessionDirectories() }.getOrDefault(emptyList())) {
             if (d.isNotBlank() && !map.containsKey(d)) {
@@ -2456,6 +2472,84 @@ private fun ProfileEditDialog(
     )
 }
 
+private val avatarPalette = mapOf(
+    "red" to Color(0xFFE53935),
+    "orange" to Color(0xFFFB8C00),
+    "yellow" to Color(0xFFFDD835),
+    "lime" to Color(0xFF7CB342),
+    "green" to Color(0xFF43A047),
+    "teal" to Color(0xFF00897B),
+    "cyan" to Color(0xFF00ACC1),
+    "blue" to Color(0xFF1E88E5),
+    "violet" to Color(0xFF7E57C2),
+    "purple" to Color(0xFF8E24AA),
+    "pink" to Color(0xFFD81B60),
+    "rose" to Color(0xFFD81B60),
+    "gray" to Color(0xFF757575),
+    "grey" to Color(0xFF757575)
+)
+
+private fun projectAvatarColor(p: Project): Color {
+    val named = p.iconColor?.lowercase()
+    if (named != null) avatarPalette[named]?.let { return it }
+    val colors = avatarPalette.values.toList()
+    return colors[(p.worktree.hashCode().absoluteValue) % colors.size]
+}
+
+private fun projectInitials(name: String): String {
+    val words = name.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+    return when {
+        words.isEmpty() -> "?"
+        words.size == 1 -> words[0].take(1).uppercase()
+        else -> (words[0].take(1) + words[1].take(1)).uppercase()
+    }
+}
+
+/** Квадратная аватарка проекта: картинка из icon.url или цвет с инициалами. */
+@Composable
+private fun ProjectAvatar(p: Project) {
+    val bg = projectAvatarColor(p)
+    var image by remember(p.iconUrl) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(p.iconUrl) {
+        val url = p.iconUrl
+        if (!url.isNullOrBlank()) {
+            image = withContext(Dispatchers.IO) {
+                runCatching {
+                    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+                        connectTimeout = 8000
+                        readTimeout = 8000
+                        instanceFollowRedirects = true
+                    }
+                    conn.inputStream.use { it.readBytes() }
+                }.getOrNull()?.let { bytes ->
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                }
+            }
+        }
+    }
+    Box(
+        Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(bg),
+        contentAlignment = Alignment.Center
+    ) {
+        val bmp = image
+        if (bmp != null) {
+            Image(
+                bmp,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Text(
+                projectInitials(p.name),
+                color = Color.White,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ProjectsScreen(
@@ -2609,11 +2703,23 @@ private fun ProjectsScreen(
             }
             LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
                 items(projects, key = { it.worktree }) { p ->
-                    Column(
-                        Modifier.fillMaxWidth().clickable { onOpen(p) }.padding(horizontal = 16.dp, vertical = 12.dp)
+                    Row(
+                        Modifier.fillMaxWidth().clickable { onOpen(p) }
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(p.name, fontSize = 16.sp, fontWeight = FontWeight.Medium)
-                        Text(p.worktree, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        ProjectAvatar(p)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(p.name, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                p.worktree,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                 }
             }

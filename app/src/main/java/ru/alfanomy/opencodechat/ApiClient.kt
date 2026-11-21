@@ -28,7 +28,14 @@ data class ChatMessage(
     val completed: Long = 0L
 )
 
-data class Project(val id: String, val name: String, val worktree: String)
+data class Project(
+    val id: String,
+    val name: String,
+    val worktree: String,
+    val iconColor: String? = null,
+    val iconUrl: String? = null,
+    val updated: Long = 0L
+)
 data class ModelInfo(
     val providerId: String,
     val providerName: String,
@@ -202,7 +209,12 @@ class ApiClient(
             val name = o.optString("name").ifBlank {
                 canonical.trimEnd('/').substringAfterLast('/').ifBlank { canonical }
             }
-            out.add(Project(o.optString("id"), name, canonical))
+            val icon = o.optJSONObject("icon")
+            val iconUrl = icon?.optString("url")?.takeIf { it.isNotBlank() }
+                ?: icon?.optString("override")?.takeIf { it.isNotBlank() }
+            val iconColor = icon?.optString("color")?.takeIf { it.isNotBlank() }
+            val updated = o.optJSONObject("time")?.optLong("updated") ?: 0L
+            out.add(Project(o.optString("id"), name, canonical, iconColor, iconUrl, updated))
         }
         return out
     }
