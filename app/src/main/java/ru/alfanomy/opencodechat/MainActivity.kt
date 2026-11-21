@@ -3726,17 +3726,28 @@ private fun ChatScreen(
             info.totalItemsCount == 0 || info.visibleItemsInfo.lastOrNull()?.index == info.totalItemsCount - 1
         }
     }
-    // Ответ, внутри которого сейчас верх экрана — к его началу ведёт верхняя стрелка.
+    // Куда ведёт верхняя стрелка: начало ответа, внутри которого сейчас верх экрана.
+    // Если верх пришёлся на вопрос — берём последний ответ.
     val answerStartIndex by remember(messages) {
         derivedStateOf {
-            val first = listState.firstVisibleItemIndex
-            if (first in messages.indices && messages[first].role == "assistant") first else -1
+            if (messages.isEmpty()) return@derivedStateOf -1
+            val header = if (historyLoading) 1 else 0
+            val first = (listState.firstVisibleItemIndex - header).coerceIn(0, messages.lastIndex)
+            if (messages[first].role == "assistant") first
+            else messages.subList(0, first).indexOfLast { it.role == "assistant" }
+                .takeIf { it >= 0 } ?: messages.indexOfLast { it.role == "assistant" }
         }
     }
+    // Кнопка видна всегда, когда есть куда листать вверх: либо уже прокручено
+    // от конца, либо верх экрана внутри ответа, но не в его начале.
     val canScrollToAnswerStart by remember {
         derivedStateOf {
-            val t = answerStartIndex
-            t >= 0 && (listState.firstVisibleItemIndex > t || listState.firstVisibleItemScrollOffset > 0)
+            val target = answerStartIndex
+            if (target < 0) return@derivedStateOf false
+            val header = if (historyLoading) 1 else 0
+            val first = listState.firstVisibleItemIndex - header
+            val offset = listState.firstVisibleItemScrollOffset
+            first > target || (first == target && offset > 0) || !atBottom
         }
     }
     var stickToBottom by remember(sessionId) { mutableStateOf(true) }
@@ -4050,7 +4061,9 @@ private fun ChatScreen(
                     onClick = {
                         listScope.launch {
                             val t = answerStartIndex
-                            if (t >= 0) listState.animateScrollToItem(t)
+                            if (t >= 0) {
+                                listState.animateScrollToItem(t + if (historyLoading) 1 else 0)
+                            }
                         }
                     },
                     shape = CircleShape,
