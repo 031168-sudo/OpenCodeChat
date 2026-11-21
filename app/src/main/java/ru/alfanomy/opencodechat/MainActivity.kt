@@ -3726,30 +3726,28 @@ private fun ChatScreen(
             info.totalItemsCount == 0 || info.visibleItemsInfo.lastOrNull()?.index == info.totalItemsCount - 1
         }
     }
-    // Куда ведёт верхняя стрелка: начало ответа, внутри которого сейчас верх экрана.
-    // Если верх пришёлся на вопрос — берём последний ответ.
-    val answerStartIndex by remember(messages) {
+    // Одно состояние на две вещи: куда ведёт верхняя стрелка и показывать ли её.
+    // Не разносим на два remember — так связанные объекты не «застревают» при
+    // обновлении списка сообщений.
+    val upNav by remember(messages) {
         derivedStateOf {
-            if (messages.isEmpty()) return@derivedStateOf -1
             val header = if (historyLoading) 1 else 0
-            val first = (listState.firstVisibleItemIndex - header).coerceIn(0, messages.lastIndex)
-            if (messages[first].role == "assistant") first
-            else messages.subList(0, first).indexOfLast { it.role == "assistant" }
-                .takeIf { it >= 0 } ?: messages.indexOfLast { it.role == "assistant" }
-        }
-    }
-    // Кнопка видна всегда, когда есть куда листать вверх: либо уже прокручено
-    // от конца, либо верх экрана внутри ответа, но не в его начале.
-    val canScrollToAnswerStart by remember {
-        derivedStateOf {
-            val target = answerStartIndex
-            if (target < 0) return@derivedStateOf false
-            val header = if (historyLoading) 1 else 0
-            val first = listState.firstVisibleItemIndex - header
+            val firstIndex = listState.firstVisibleItemIndex - header
             val offset = listState.firstVisibleItemScrollOffset
-            first > target || (first == target && offset > 0) || !atBottom
+            val target = if (messages.isEmpty()) {
+                -1
+            } else {
+                val idx = firstIndex.coerceIn(0, messages.lastIndex)
+                if (messages[idx].role == "assistant") idx
+                else messages.subList(0, idx).indexOfLast { it.role == "assistant" }
+                    .takeIf { it >= 0 } ?: messages.indexOfLast { it.role == "assistant" }
+            }
+            val show = target >= 0 &&
+                (firstIndex > target || (firstIndex == target && offset > 0) || !atBottom)
+            target to show
         }
     }
+
     var stickToBottom by remember(sessionId) { mutableStateOf(true) }
     var stickReady by remember(sessionId) { mutableStateOf(false) }
     LaunchedEffect(listState, sessionId) {
@@ -4056,12 +4054,12 @@ private fun ChatScreen(
                 }
                 item { Spacer(Modifier.height(1.dp)) }
             }
-            if (canScrollToAnswerStart) {
+            if (upNav.second) {
                 Surface(
                     onClick = {
-                        listScope.launch {
-                            val t = answerStartIndex
-                            if (t >= 0) {
+                        val t = upNav.first
+                        if (t >= 0) {
+                            listScope.launch {
                                 listState.animateScrollToItem(t + if (historyLoading) 1 else 0)
                             }
                         }
