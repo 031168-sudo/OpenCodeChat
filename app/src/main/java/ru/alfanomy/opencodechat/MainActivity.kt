@@ -2622,7 +2622,7 @@ private fun ProjectsScreen(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun SessionsScreen(
     title: String, subtitle: String,
@@ -2649,15 +2649,16 @@ private fun SessionsScreen(
         }
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
-            Row(
+            FlowRow(
                 Modifier.fillMaxWidth().padding(16.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Button(onClick = onNew, enabled = !busy, modifier = Modifier.weight(1f)) {
-                    Text("+ Новый чат")
+                    Text("+ Новый чат", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 OutlinedButton(onClick = onUsage, enabled = !busy && sessions.isNotEmpty()) {
-                    Text("Использование")
+                    Text("Использование", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
             if (busy) Box(Modifier.fillMaxWidth().padding(8.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(Modifier.size(28.dp)) }
