@@ -153,9 +153,13 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.changedToDown
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -3659,6 +3663,7 @@ private fun ChatScreen(
 
     val listState = rememberLazyListState()
     val listScope = rememberCoroutineScope()
+    val focusManager = LocalFocusManager.current
     var historyArmed by remember(sessionId) { mutableStateOf(false) }
     var pendingAnchor by remember(sessionId) { mutableStateOf<Pair<String, Int>?>(null) }
     var revertTarget by remember(sessionId) { mutableStateOf<ChatMessage?>(null) }
@@ -3906,7 +3911,23 @@ private fun ChatScreen(
         }
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
-            Box(Modifier.weight(1f).fillMaxWidth()) {
+            Box(
+                Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .pointerInput(Unit) {
+                        // любое касание переписки (тап или начало прокрутки) —
+                        // убираем фокус с поля ввода и прячем клавиатуру
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                if (event.changes.any { it.changedToDown() }) {
+                                    focusManager.clearFocus()
+                                }
+                            }
+                        }
+                    }
+            ) {
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
