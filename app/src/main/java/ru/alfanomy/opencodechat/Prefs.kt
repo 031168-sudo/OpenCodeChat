@@ -149,6 +149,11 @@ class Prefs(context: Context) {
         get() = sp.getLong("contextUsed", 0L)
         set(v) = sp.edit().putLong("contextUsed", v).apply()
 
+    /** Последний удачный список моделей (JSON) — на случай 503 от /api/model. */
+    var modelsCache: String
+        get() = sp.getString("modelsCache", "") ?: ""
+        set(v) = sp.edit().putString("modelsCache", v).apply()
+
     var hiddenModels: Set<String>
         get() = sp.getStringSet(scoped("hiddenModels"), emptySet()) ?: emptySet()
         set(v) = sp.edit().putStringSet(scoped("hiddenModels"), v).apply()

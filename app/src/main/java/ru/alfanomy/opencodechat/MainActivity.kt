@@ -283,6 +283,42 @@ private fun preferredProject(a: Project, b: Project): Project {
     )
 }
 
+private fun modelsToJson(list: List<ModelInfo>): String {
+    val arr = JSONArray()
+    list.forEach { m ->
+        arr.put(
+            JSONObject()
+                .put("p", m.providerId)
+                .put("pn", m.providerName)
+                .put("m", m.modelId)
+                .put("n", m.name)
+                .put("v", JSONArray(m.variants))
+                .put("f", m.free)
+                .put("c", m.contextLimit)
+        )
+    }
+    return arr.toString()
+}
+
+private fun modelsFromJson(text: String): List<ModelInfo> = runCatching {
+    val arr = JSONArray(text)
+    (0 until arr.length()).map { i ->
+        val o = arr.getJSONObject(i)
+        val variants = ArrayList<String>()
+        val va = o.optJSONArray("v")
+        if (va != null) for (j in 0 until va.length()) variants.add(va.optString(j))
+        ModelInfo(
+            providerId = o.optString("p"),
+            providerName = o.optString("pn"),
+            modelId = o.optString("m"),
+            name = o.optString("n"),
+            variants = variants,
+            free = o.optBoolean("f"),
+            contextLimit = o.optLong("c")
+        )
+    }
+}.getOrDefault(emptyList())
+
 private fun usableProjects(list: List<Project>): List<Project> =
     list.filter { it.worktree.isNotBlank() && it.worktree != "/" }
         .distinctBy { it.worktree }
@@ -705,11 +741,40 @@ private fun App() {
         }
     }
 
+    /** Список моделей с повторами: сервер отдаёт 503, когда не смог обновить
+     *  каталог models.dev. При неудаче берём последний удачный список из кэша. */
+    suspend fun fetchModels(): List<ModelInfo> {
+        var loaded: List<ModelInfo>? = null
+        var lastError: String? = null
+        for (attempt in 1..3) {
+            val r = runCatching { withContext(Dispatchers.IO) { client().listModels() } }
+            val list = r.getOrNull()
+            if (list != null && list.isNotEmpty()) {
+                loaded = list
+                break
+            }
+            lastError = r.exceptionOrNull()?.message
+            if (attempt < 3) delay(1200)
+        }
+        val fresh = loaded
+        if (fresh != null) {
+            prefs.modelsCache = modelsToJson(fresh)
+            return fresh
+        }
+        val cached = modelsFromJson(prefs.modelsCache)
+        if (cached.isNotEmpty()) {
+            if (status.isBlank()) {
+                status = "Каталог моделей из кэша: сервер временно не отдаёт список"
+            }
+            return cached
+        }
+        if (lastError != null && status.isBlank()) status = "Модели не загрузились: $lastError"
+        return emptyList()
+    }
+
     fun loadModels() {
         scope.launch {
-            val loaded = withContext(Dispatchers.IO) {
-                runCatching { client().listModels() }.getOrDefault(emptyList())
-            }
+            val loaded = fetchModels()
             models = loaded
             ensureModelAvailable(loaded)
         }
@@ -1692,9 +1757,7 @@ private fun App() {
             if (!connected && status.isBlank()) status = "Сервер недоступен"
             // Списки грузим сразу и параллельно, чтобы не тормозить показ чата.
             val projectsJob = async(Dispatchers.IO) { collectProjects() }
-            val modelsJob = async(Dispatchers.IO) {
-                runCatching { client().listModels() }.getOrDefault(emptyList())
-            }
+            val modelsJob = async { fetchModels() }
             val agentsJob = async(Dispatchers.IO) {
                 runCatching { client().listAgents() }.getOrDefault(emptyList())
             }
@@ -1942,7 +2005,7 @@ private fun App() {
                     },
                     onSend = { send() },
                     onStop = { stopGeneration() },
-                    onOpenModelPicker = { modelQuery = ""; showModelPicker = true },
+                    onOpenModelPicker = { modelQuery = ""; showModelPicker = true; if (models.isEmpty()) loadModels() },
                     onSessionAction = { sessionAction(it) },
                     onPickCommand = { pickCommand(it) },
                     onSelectVariant = { variant = it; prefs.variant = it },
@@ -1999,6 +2062,7 @@ private fun App() {
             onQuery = { modelQuery = it },
             onDismiss = { showModelPicker = false },
             onManage = { showModelPicker = false; showManageModels = true },
+            onReload = { loadModels() },
             onPick = { pendingModel = it; showModelPicker = false }
         )
     }
@@ -4843,7 +4907,8 @@ private fun AttachmentThumb(data: String) {
 private fun ModelPickerDialog(
     models: List<ModelInfo>, providerId: String, modelId: String,
     query: String, onQuery: (String) -> Unit,
-    onDismiss: () -> Unit, onManage: () -> Unit, onPick: (ModelInfo) -> Unit
+    onDismiss: () -> Unit, onManage: () -> Unit, onReload: () -> Unit,
+    onPick: (ModelInfo) -> Unit
 ) {
     val filtered = models.filter {
         query.isBlank() || it.name.contains(query, ignoreCase = true) || it.modelId.contains(query, ignoreCase = true)
@@ -4851,7 +4916,18 @@ private fun ModelPickerDialog(
     val grouped = filtered.groupBy { it.providerName }.toSortedMap()
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Выбор модели") },
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Выбор модели", modifier = Modifier.weight(1f))
+                IconButton(onClick = onReload, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Filled.Refresh,
+                        contentDescription = "Обновить список моделей",
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        },
         text = {
             Column(Modifier.heightIn(max = 460.dp)) {
                 OutlinedTextField(
@@ -4863,6 +4939,14 @@ private fun ModelPickerDialog(
                     leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) }
                 )
                 Spacer(Modifier.height(8.dp))
+                if (filtered.isEmpty()) {
+                    Text(
+                        "Модели не загрузились. Нажмите ↻ или «Настроить модели».",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 8.dp)
+                    )
+                }
                 LazyColumn(Modifier.weight(1f, fill = false)) {
                     grouped.forEach { (provider, list) ->
                         item {
