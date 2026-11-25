@@ -557,14 +557,39 @@ private fun App() {
         return true
     }
 
+    fun isDnsError(e: Throwable): Boolean =
+        e is java.net.UnknownHostException ||
+            (e.message ?: "").contains("Unable to resolve host", ignoreCase = true)
+
+    fun friendlyError(e: Throwable): String {
+        if (!isDnsError(e)) return e.message ?: "Ошибка"
+        val host = Regex("""host "?([^":]+)""")
+            .find(e.message ?: "")?.groupValues?.getOrNull(1).orEmpty()
+        return if (host.isNotBlank()) {
+            "Не удалось найти $host (DNS). Проверьте Tailscale/VPN или укажите резервный адрес в настройках."
+        } else {
+            "Не удалось найти сервер по имени (DNS). Проверьте Tailscale/VPN."
+        }
+    }
+
+    /** DNS мог отвалиться при смене сети — перевыбираем канал и пробуем ещё раз. */
+    suspend fun <T> withDnsRetry(block: suspend () -> T): T {
+        return try {
+            block()
+        } catch (e: Exception) {
+            if (!isDnsError(e) || !resolveConnection()) throw e
+            block()
+        }
+    }
+
     fun run(block: suspend () -> Unit) {
         scope.launch {
             busy = true
             status = ""
             try {
-                block()
+                withDnsRetry { block() }
             } catch (e: Exception) {
-                status = e.message ?: "Ошибка"
+                status = friendlyError(e)
             } finally {
                 busy = false
             }
@@ -1568,14 +1593,16 @@ private fun App() {
         )
         scope.launch {
             try {
-                withContext(Dispatchers.IO) {
-                    client().sendAsync(
-                        s.id, text, sent, providerId, modelId, variant, agent,
-                        mentions = mentionFiles
-                    )
+                withDnsRetry {
+                    withContext(Dispatchers.IO) {
+                        client().sendAsync(
+                            s.id, text, sent, providerId, modelId, variant, agent,
+                            mentions = mentionFiles
+                        )
+                    }
                 }
             } catch (e: Exception) {
-                status = e.message ?: "Ошибка"
+                status = friendlyError(e)
                 busy = false
                 return@launch
             }
