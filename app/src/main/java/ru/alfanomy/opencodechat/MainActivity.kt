@@ -5328,7 +5328,7 @@ private fun NewProjectDialog(
 
 private val inlineMd = Regex(
     "\\[([^\\]]+)\\]\\(([^)\\s]+)\\)" +
-        "|https?://[^\\s)\\]]+" +
+        "|https?://[^\\s)\\]<>]+" +
         "|(`{1,3})([^`].*?)\\3" +
         "|\\*\\*([^*]+)\\*\\*"
 )
@@ -5347,11 +5347,36 @@ private fun AnnotatedString.Builder.appendInlineMarkdown(text: String, linkColor
                     appendInlineMarkdown(m.groupValues[1], linkColor)
                 }
 
-            value.startsWith("http") ->
-                withLink(LinkAnnotation.Url(value, linkStyle)) { append(value) }
+            value.startsWith("http") -> {
+                // хвостовая пунктуация не должна попадать в ссылку: «…apk.»
+                var url = value
+                var tail = ""
+                while (url.isNotEmpty() && url.last() in ".,;:!?") {
+                    tail = url.last() + tail
+                    url = url.dropLast(1)
+                }
+                withLink(LinkAnnotation.Url(url, linkStyle)) { append(url) }
+                if (tail.isNotEmpty()) append(tail)
+            }
 
-            m.groups[4] != null ->
-                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(m.groupValues[4].trim()) }
+            m.groups[4] != null -> {
+                val code = m.groupValues[4].trim()
+                if (code.startsWith("http://") || code.startsWith("https://")) {
+                    // модель часто пишет ссылку в обратных кавычках — оставляем
+                    // моноширинный вид, но делаем кликабельной
+                    withLink(LinkAnnotation.Url(code, linkStyle)) {
+                        withStyle(
+                            SpanStyle(
+                                fontFamily = FontFamily.Monospace,
+                                color = linkColor,
+                                textDecoration = TextDecoration.Underline
+                            )
+                        ) { append(code) }
+                    }
+                } else {
+                    withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(code) }
+                }
+            }
 
             m.groups[5] != null ->
                 withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
